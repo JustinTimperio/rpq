@@ -1,5 +1,5 @@
 use std::time::{Instant, Duration};
-use std::collections::{BinaryHeap, HashMap};
+use std::collections::{BinaryHeap, HashMap, LinkedList, VecDeque};
 use std::sync::{Arc, Mutex};
 use std::cmp::Ordering;
 use std::error::Error;
@@ -7,7 +7,6 @@ use std::thread;
 use std::sync::atomic::AtomicU64;
 use std::sync::atomic::Ordering as AtomicOrdering;
 use rand::Rng;
-
 
 struct RPQ<T> {
     // total_len is the number of items across all queues
@@ -19,7 +18,7 @@ struct RPQ<T> {
     // bucket_len_map is a map of priorities to the number of items in the queue
     bucket_len_map: HashMap<u64, u64>,
     // non_empty_buckets is a binary heap of priorities
-    non_empty_buckets: BinaryHeap<u64>,
+    non_empty_buckets: BucketPriorityQueue,
 }
 
 // Item is a struct that holds the data and metadata for an item in the queue
@@ -56,6 +55,56 @@ impl<T: PartialEq> PartialEq for Item<T> {
 
 impl<T: PartialEq> Eq for Item<T> {}
 
+struct Bucket {
+    bucket_id: u64,
+}
+
+struct BucketPriorityQueue {
+    mutex: Mutex<()>,
+    buckets: HashMap<u64, Bucket>,
+    bucket_ids: VecDeque<u64>,
+}
+
+impl BucketPriorityQueue {
+    fn new() -> Self {
+        Self {
+            mutex: Mutex::new(()),
+            buckets: HashMap::new(),
+            bucket_ids: VecDeque::new(),
+        }
+    }
+
+    fn len(&self) -> usize {
+        self.buckets.len()
+    }
+
+    fn peek(&self) -> Option<u64> {
+        self.bucket_ids.front().cloned()
+    }
+
+    fn add(&mut self, bucket_id: u64) {
+        let _guard: std::sync::MutexGuard<'_, ()> = self.mutex.lock().unwrap();
+
+        if self.buckets.contains_key(&bucket_id) {
+            return;
+        }
+
+        let new_bucket: Bucket = Bucket {
+            bucket_id,
+        };
+
+        self.buckets.insert(bucket_id, new_bucket);
+        self.bucket_ids.push_back(bucket_id);
+    }
+
+    fn remove(&mut self, bucket_id: u64) {
+        let _guard: std::sync::MutexGuard<'_, ()> = self.mutex.lock().unwrap();
+
+        self.buckets.remove(&bucket_id);
+        self.bucket_ids.retain(|&id| id != bucket_id);
+    }
+}
+
 
 impl <T: Ord> RPQ<T> {
     fn new(num_buckets: u64) -> RPQ<T> {
@@ -64,7 +113,7 @@ impl <T: Ord> RPQ<T> {
             buckets: HashMap::new(),
             bucket_mutex_map: HashMap::new(),
             bucket_len_map: HashMap::new(),
-            non_empty_buckets: BinaryHeap::new(),
+            non_empty_buckets: BucketPriorityQueue::new(),
         };
 
         // Initialize the buckets, bucket_mutex_map, and bucket_len_map
@@ -105,19 +154,18 @@ impl <T: Ord> RPQ<T> {
         *bucket_len += 1;
         self.total_len += 1;
 
-        // Add the priority to the non_empty_buckets if it is not already there
-        if !self.non_empty_buckets.iter().any(|&p| p == priority) {
-            self.non_empty_buckets.push(priority);
-        }
-
+        // Update the non-empty buckets
+        self.non_empty_buckets.add(priority);
+ 
     }
+
 
     fn dequeue(&mut self) -> Result<T, Box<dyn Error>> {
         // Loop until we find a non-empty bucket
         loop {
             // Get the priority of the non-empty bucket with the highest priority
             let bucket = match self.non_empty_buckets.peek() {
-                Some(bucket) => *bucket,
+                Some(bucket) => bucket,
                 None => return Err("No items in the queue".into()),
             };
 
@@ -135,11 +183,11 @@ impl <T: Ord> RPQ<T> {
             // Get the length of the bucket
             let bucket_len: &mut u64 = self.bucket_len_map.get_mut(&bucket).expect("No bucket length");
 
-            let item = match item {
+            let item: Item<T> = match item {
                 Some(item) => item,
                 None => {
                     if *bucket_len == 0 {
-                        self.non_empty_buckets.pop();
+                        self.non_empty_buckets.remove(bucket);
                     }
                     continue; // Continue the loop to find a non-empty bucket
                 }
@@ -147,15 +195,12 @@ impl <T: Ord> RPQ<T> {
 
             *bucket_len -= 1;
             self.total_len -= 1;
-            if *bucket_len == 0 {
-                self.non_empty_buckets.pop();
-            }
+
             return Ok(item.data);
         }
     }
-
-
 }
+
 
 fn main() {
     let threads: i32 = 10;
@@ -178,8 +223,12 @@ fn main() {
                 let can_timeout: bool = false;
                 let timeout: Duration = Duration::from_secs(10);
 
-                let mut rpq: std::sync::MutexGuard<'_, RPQ<i32>> = rpq_clone.lock().unwrap();
-                rpq.enqueue(priority, i, escalate, escalation_rate, can_timeout, timeout);
+                // Lock the RPQ object only for the duration of the enqueue operation
+                // Is this why performance is so dogshit?
+                {
+                    let mut rpq: std::sync::MutexGuard<'_, RPQ<i32>> = rpq_clone.lock().unwrap();
+                    rpq.enqueue(priority, i, escalate, escalation_rate, can_timeout, timeout);
+                }
                 sent_clone.fetch_add(1, AtomicOrdering::SeqCst);
             }
         });
