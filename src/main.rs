@@ -1,251 +1,146 @@
-use std::time::{Instant, Duration};
-use std::collections::{BinaryHeap, HashMap, LinkedList, VecDeque};
-use std::sync::{Arc, Mutex};
-use std::cmp::Ordering;
-use std::error::Error;
-use std::thread;
-use std::sync::atomic::AtomicU64;
-use std::sync::atomic::Ordering as AtomicOrdering;
 use rand::Rng;
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, RwLock};
+use uuid::Uuid;
 
-struct RPQ<T> {
+extern crate scopeguard;
+
+mod bpq;
+mod pq;
+mod schema;
+
+struct RPQ<T: Ord + Clone> {
     // total_len is the number of items across all queues
-    total_len: u64,
-    // buckets is a map of priorities to a binary heap of items
-    buckets: HashMap<u64, BinaryHeap<Item<T>>>,
-    // bucket_mutex_map is a map of priorities to a mutex
-    bucket_mutex_map: HashMap<u64, std::sync::Mutex<()>>,
-    // bucket_len_map is a map of priorities to the number of items in the queue
-    bucket_len_map: HashMap<u64, u64>,
+    pub bucket_count: u64,
     // non_empty_buckets is a binary heap of priorities
-    non_empty_buckets: BucketPriorityQueue,
+    pub non_empty_buckets: bpq::BucketPriorityQueue,
+
+    // buckets is a map of priorities to a binary heap of items
+    buckets: Arc<RwLock<HashMap<u64, pq::PriorityQueue<T>>>>,
 }
 
-// Item is a struct that holds the data and metadata for an item in the queue
-struct Item<T> {
-    priority: u64,
-    data: T,
-    should_escalate: bool,
-    escalation_rate: Duration,
-    can_timeout: bool,
-    timeout: Duration,
-    submitted: Instant,
-    last_escalation: Instant,
-}
+impl<T: Ord + Clone> RPQ<T> {
+    fn new(bucket_count: u64) -> RPQ<T> {
+        let buckets = Arc::new(RwLock::new(HashMap::new()));
 
-// Implement the Ord, PartialOrd, PartialEq, and Eq traits for Item
-// Why do we need to implement these traits?
-impl<T: Ord> Ord for Item<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.priority.cmp(&other.priority)
-    }
-}
+        for i in 0..bucket_count {
+            buckets
+                .write()
+                .unwrap()
+                .insert(i, pq::PriorityQueue::new(bpq::BucketPriorityQueue::new()));
+        }
 
-impl<T: Ord> PartialOrd for Item<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T: PartialEq> PartialEq for Item<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority
-    }
-}
-
-impl<T: PartialEq> Eq for Item<T> {}
-
-struct Bucket {
-    bucket_id: u64,
-}
-
-struct BucketPriorityQueue {
-    mutex: Mutex<()>,
-    buckets: HashMap<u64, Bucket>,
-    bucket_ids: VecDeque<u64>,
-}
-
-impl BucketPriorityQueue {
-    fn new() -> Self {
-        Self {
-            mutex: Mutex::new(()),
-            buckets: HashMap::new(),
-            bucket_ids: VecDeque::new(),
+        RPQ {
+            bucket_count,
+            non_empty_buckets: bpq::BucketPriorityQueue::new(),
+            buckets,
         }
     }
 
-    fn len(&self) -> usize {
-        self.buckets.len()
-    }
+    fn len(&self) -> u64 {
+        let mut total_len: u64 = 0;
 
-    fn peek(&self) -> Option<u64> {
-        self.bucket_ids.front().cloned()
-    }
-
-    fn add(&mut self, bucket_id: u64) {
-        let _guard: std::sync::MutexGuard<'_, ()> = self.mutex.lock().unwrap();
-
-        if self.buckets.contains_key(&bucket_id) {
-            return;
+        for (_, queue) in self.buckets.read().unwrap().iter() {
+            total_len += queue.len();
         }
 
-        let new_bucket: Bucket = Bucket {
-            bucket_id,
-        };
-
-        self.buckets.insert(bucket_id, new_bucket);
-        self.bucket_ids.push_back(bucket_id);
+        total_len
     }
 
-    fn remove(&mut self, bucket_id: u64) {
-        let _guard: std::sync::MutexGuard<'_, ()> = self.mutex.lock().unwrap();
+    fn peek(&self) -> Option<schema::Item<T>> {
+        let bucket_id: u64 = self.non_empty_buckets.peek()?;
+        self.buckets.read().unwrap().get(&bucket_id)?.peek()
+    }
 
-        self.buckets.remove(&bucket_id);
-        self.bucket_ids.retain(|&id| id != bucket_id);
+    fn enqueue(&self, item: schema::Item<T>) {
+        let bucket_id: u64 = item.priority;
+        self.buckets
+            .read()
+            .unwrap()
+            .get(&bucket_id)
+            .unwrap()
+            .enqueue(item.clone());
+        self.non_empty_buckets.add_bucket(bucket_id);
+    }
+
+    fn dequeue(&self) -> Option<schema::Item<T>> {
+        let bucket_id: u64 = self.non_empty_buckets.peek()?;
+        let item = self.buckets.read().unwrap().get(&bucket_id)?.dequeue()?;
+
+        if self.buckets.read().unwrap().get(&bucket_id)?.len() == 0 {
+            self.non_empty_buckets.remove_bucket(bucket_id);
+        }
+        Some(item)
     }
 }
-
-
-impl <T: Ord> RPQ<T> {
-    fn new(num_buckets: u64) -> RPQ<T> {
-        let mut rpq = RPQ {
-            total_len: 0,
-            buckets: HashMap::new(),
-            bucket_mutex_map: HashMap::new(),
-            bucket_len_map: HashMap::new(),
-            non_empty_buckets: BucketPriorityQueue::new(),
-        };
-
-        // Initialize the buckets, bucket_mutex_map, and bucket_len_map
-        for i in 0..num_buckets {
-            rpq.buckets.insert(i, BinaryHeap::new());
-            rpq.bucket_mutex_map.insert(i, std::sync::Mutex::new(()));
-            rpq.bucket_len_map.insert(i, 0);
-        }
-
-        rpq
-    }
-
-    fn enqueue(&mut self, priority: u64, data: T, escalate : bool, escalation_rate: Duration, can_timeout: bool, timeout: Duration) {
-
-        // Create the item
-        let object: Item<T> = Item {
-            priority: priority,
-            data: data,
-            should_escalate: escalate,
-            escalation_rate: escalation_rate,
-            can_timeout: can_timeout,
-            timeout: timeout,
-            submitted: Instant::now(),
-            last_escalation: Instant::now(),
-        };
-
-        // Lock the bucket mutex
-        let bucket_mutex: &Mutex<()> = self.bucket_mutex_map.get(&priority).expect("No bucket mutex");
-        let _lock: std::sync::MutexGuard<'_, ()> = bucket_mutex.lock().unwrap();
-
-        // Update the bucket length
-        let bucket_len: &mut u64 = self.bucket_len_map.entry(priority).or_insert(0);
-
-        // Insert the object into the bucket
-        self.buckets.get_mut(&priority).unwrap().push(object);
-
-        // Update the bucket length
-        *bucket_len += 1;
-        self.total_len += 1;
-
-        // Update the non-empty buckets
-        self.non_empty_buckets.add(priority);
- 
-    }
-
-
-    fn dequeue(&mut self) -> Result<T, Box<dyn Error>> {
-        // Loop until we find a non-empty bucket
-        loop {
-            // Get the priority of the non-empty bucket with the highest priority
-            let bucket = match self.non_empty_buckets.peek() {
-                Some(bucket) => bucket,
-                None => return Err("No items in the queue".into()),
-            };
-
-            // Lock the bucket mutex
-            let bucket_mutex: &Mutex<()>  = self.bucket_mutex_map.get(&bucket).expect( "No bucket mutex");
-            let _lock: std::sync::MutexGuard<'_, ()> = bucket_mutex.lock().unwrap();
-
-
-            // Get the length of the bucket
-            let item: Option<Item<T>> = match self.buckets.get_mut(&bucket) {
-                Some(bucket) => bucket.pop(),
-                None => return Err("No items in the bucket".into()),
-            };
-
-            // Get the length of the bucket
-            let bucket_len: &mut u64 = self.bucket_len_map.get_mut(&bucket).expect("No bucket length");
-
-            let item: Item<T> = match item {
-                Some(item) => item,
-                None => {
-                    if *bucket_len == 0 {
-                        self.non_empty_buckets.remove(bucket);
-                    }
-                    continue; // Continue the loop to find a non-empty bucket
-                }
-            };
-
-            *bucket_len -= 1;
-            self.total_len -= 1;
-
-            return Ok(item.data);
-        }
-    }
-}
-
 
 fn main() {
-    let threads: i32 = 10;
+    let send_threads = 10;
+    let receive_threads = 1;
+    let bucket_count = 10;
+    let rpq = Arc::new(RPQ::new(bucket_count));
 
-    let start: Instant = Instant::now();
-    let sent: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let received: Arc<AtomicU64> = Arc::new(AtomicU64::new(0));
-    let rpq: Arc<Mutex<RPQ<i32>>> = Arc::new(Mutex::new(RPQ::new(100)));
-
-    let mut handles: Vec<thread::JoinHandle<()>> = vec![];
-
-    for _ in 0..threads {
-        let rpq_clone: Arc<Mutex<RPQ<i32>>> = Arc::clone(&rpq);
-        let sent_clone: Arc<AtomicU64> = Arc::clone(&sent);
-        let handle: thread::JoinHandle<()> = thread::spawn(move || {
-            for i in 0..10_000_000 / threads {
-                let priority: u64 = rand::thread_rng().gen_range(0..100);
-                let escalate: bool = false;
-                let escalation_rate: Duration = Duration::from_secs(1);
-                let can_timeout: bool = false;
-                let timeout: Duration = Duration::from_secs(10);
-
-                // Lock the RPQ object only for the duration of the enqueue operation
-                // Is this why performance is so dogshit?
-                {
-                    let mut rpq: std::sync::MutexGuard<'_, RPQ<i32>> = rpq_clone.lock().unwrap();
-                    rpq.enqueue(priority, i, escalate, escalation_rate, can_timeout, timeout);
-                }
-                sent_clone.fetch_add(1, AtomicOrdering::SeqCst);
+    // Enqueue items
+    let mut send_handles = Vec::new();
+    let sent = Arc::new(AtomicU64::new(0));
+    for i in 0..send_threads {
+        let rpq_clone = Arc::clone(&rpq);
+        let sent_clone = Arc::clone(&sent);
+        println!("Spawning thread {}", i);
+        send_handles.push(std::thread::spawn(move || {
+            for j in 0..10_000_000 / send_threads {
+                let item: schema::Item<u64> = schema::Item {
+                    // Random priority between 0 and 9
+                    priority: rand::thread_rng().gen_range(0..bucket_count),
+                    data: j,
+                    disk_uuid: Some(Uuid::new_v4().to_string()),
+                    should_escalate: false,
+                    escalation_rate: None,
+                    can_timeout: false,
+                    timeout: None,
+                    submitted_at: std::time::Instant::now(),
+                    last_escalation: None,
+                    index: 0,
+                    batch_id: 0,
+                    was_restored: false,
+                };
+                // This is safe because the item is only used in this thread
+                // and the thread is joined before the item goes out of scope
+                rpq_clone.enqueue(item);
+                sent_clone.fetch_add(1, Ordering::Relaxed);
             }
-        });
-        handles.push(handle);
+        }));
     }
 
-    for handle in handles {
-        handle.join().unwrap(); // Wait for each thread to finish
+    // Dequeue items
+    let received = Arc::new(AtomicU64::new(0));
+    let mut receive_handles = Vec::new();
+    for i in 0..receive_threads {
+        println!("Spawning dequeue thread {}", i);
+        let rpq_clone = Arc::clone(&rpq);
+        let recived_clone = Arc::clone(&received);
+        receive_handles.push(std::thread::spawn(move || {
+            for _ in 0..10_000_000 / receive_threads {
+                loop {
+                    if let Some(_item) = rpq_clone.dequeue() {
+                        recived_clone.fetch_add(1, Ordering::Relaxed);
+                        break;
+                    }
+                }
+            }
+        }));
     }
 
-    while let Ok(_top) = rpq.lock().unwrap().dequeue() {
-        received.fetch_add(1, AtomicOrdering::SeqCst);
+    // Wait for all threads to finish
+    for handle in send_handles {
+        handle.join().unwrap();
     }
+    println!("Sent: {}", sent.load(Ordering::Relaxed));
 
-    let end: Instant = Instant::now();
-
-    println!("Sent: {} Received: {}", sent.load(AtomicOrdering::SeqCst), received.load(AtomicOrdering::SeqCst));
-    println!("Time to send and remove 10 million integers: {:?}", end.duration_since(start));
+    // Wait for all threads to finish
+    for handle in receive_handles {
+        handle.join().unwrap();
+    }
+    println!("Recived: {}", received.load(Ordering::Relaxed));
 }
-

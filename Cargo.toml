@@ -3,7 +3,11 @@ name = "rpq"
 version = "0.1.0"
 edition = "2021"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
-
 [dependencies]
+flamegraph = "0.6.5"
 rand = "0.8.4"
+scopeguard = "1.2.0"
+uuid = { version = "1.10.0", features = ["v4"] }
+
+[profile.release]
+debug = true

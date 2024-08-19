@@ -24,6 +24,8 @@
 
 ## Benchmarks
 
+![profile](./docs/flamegraph.svg)
+
 ## Usage
 
 ### Prerequisites 
@@ -71,8 +73,6 @@ We use GitHub issues to track public bugs. Report a bug by opening a new issue; 
 - What actually happens
 - Notes (possibly including why you think this might be happening, or stuff you tried that didn't work)
 
-### License
-By contributing, you agree that your contributions will be licensed under its MIT License.
 
 ## License
 All code here was originally written by me, Justin Timperio, under an MIT license with the exception of some code directly forked under a BSD license from the Go maintainers.
