@@ -87,6 +87,7 @@ impl<T: Ord + Clone> RPQ<T> {
         // Fetch the bucket
         let bucket_id = self.non_empty_buckets.peek();
         if bucket_id.is_none() {
+            println!("Bucket id is none");
             return None;
         }
         let bucket_id = bucket_id.unwrap();
@@ -94,17 +95,14 @@ impl<T: Ord + Clone> RPQ<T> {
         // Fetch the queue
         let queue = buckets.get(&bucket_id);
         if queue.is_none() {
-            println!("Bucket is none for id: {}", bucket_id);
             return None;
         }
 
         // Fetch the item from the bucket
         let item = queue.unwrap().dequeue();
-        if item.is_none() {
-            self.non_empty_buckets.remove_bucket(bucket_id);
-            return None;
+        if !item.is_none() {
+            self.items_in_queues.fetch_sub(1, Ordering::Relaxed);
         }
-        self.items_in_queues.fetch_sub(1, Ordering::Relaxed);
 
         // If the bucket is empty, remove it from the non_empty_buckets
         if queue.unwrap().len() == 0 {
@@ -119,7 +117,7 @@ fn main() {
     let message_count = 10_000_000;
 
     // Set Concurrency
-    let send_threads = 20;
+    let send_threads = 30;
     let receive_threads = 1;
     let bucket_count = 10;
     let sent_counter = Arc::new(AtomicU64::new(0));
@@ -168,9 +166,12 @@ fn main() {
                 }
             }
 
-            if let Some(_item) = rpq_clone.dequeue() {
-                recived_clone.fetch_add(1, Ordering::Relaxed);
+            let item = rpq_clone.dequeue();
+            if item.is_none() {
+                continue;
             }
+
+            recived_clone.fetch_add(1, Ordering::Relaxed);
         }));
     }
 

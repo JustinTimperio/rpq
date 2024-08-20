@@ -1,24 +1,19 @@
-use std::cmp::Ordering;
 use std::time::{Duration, Instant};
-use std::{collections::BinaryHeap, sync::RwLock};
+use std::{collections::VecDeque, sync::RwLock};
 
 pub struct PriorityQueue<T: Ord + Clone> {
-    items: RwLock<BinaryHeap<Item<T>>>,
+    items: RwLock<VecDeque<Item<T>>>,
 }
 
 impl<T: Ord + Clone> PriorityQueue<T> {
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
-            items: RwLock::new(BinaryHeap::new()),
+            items: RwLock::new(VecDeque::new()),
         }
     }
 
     pub fn len(&self) -> u64 {
         self.items.read().unwrap().len() as u64
-    }
-
-    pub fn peek(&self) -> Option<Item<T>> {
-        self.items.read().unwrap().peek().cloned()
     }
 
     pub fn enqueue(&self, item: Item<T>) {
@@ -30,32 +25,27 @@ impl<T: Ord + Clone> PriorityQueue<T> {
         item.was_restored = false;
 
         // Add the item to the queue
-        self.items.write().unwrap().push(item);
+        self.items.write().unwrap().push_back(item);
     }
 
     pub fn dequeue(&self) -> Option<Item<T>> {
-        self.items.write().unwrap().pop()
+        self.items.write().unwrap().pop_front()
     }
 
-    pub fn update_priority(&self, item: &Item<T>, new_priority: u64) {
-        // Create a clone of the item with the new priority
-        let mut item_clone = item.clone();
-        item_clone.priority = new_priority;
-        item_clone.last_escalation = Some(Instant::now());
-
-        // Remove the old item and insert the new item
-        let mut items = self.items.write().unwrap();
-        items.retain(|x| x != item);
-        items.push(item_clone);
+    pub fn peek(&self) -> Option<Item<T>> {
+        self.items.read().unwrap().front().cloned()
     }
 
     pub fn prioritize(&self) {
-        let items = self.items.write().unwrap();
-        for item in items.iter() {
+        let mut items = self.items.write().unwrap();
+        let mut to_remove = Vec::new();
+        let mut to_swap = Vec::new();
+
+        for (index, item) in items.iter_mut().enumerate() {
             // Timeout items that have been in the queue for too long
             if item.can_timeout {
                 if item.timeout.unwrap().as_secs() > item.submitted_at.elapsed().as_secs() {
-                    self.remove(item);
+                    to_remove.push(index);
                     continue;
                 }
             }
@@ -67,7 +57,10 @@ impl<T: Ord + Clone> PriorityQueue<T> {
                     if item.escalation_rate.unwrap().as_secs()
                         > item.submitted_at.elapsed().as_secs()
                     {
-                        self.update_priority(item, item.priority + 1);
+                        item.last_escalation = Some(Instant::now());
+                        if index > 0 {
+                            to_swap.push(index);
+                        }
                         continue;
                     }
                 } else {
@@ -75,16 +68,23 @@ impl<T: Ord + Clone> PriorityQueue<T> {
                     if item.escalation_rate.unwrap().as_secs()
                         > item.last_escalation.unwrap().elapsed().as_secs()
                     {
-                        self.update_priority(item, item.priority + 1);
+                        item.last_escalation = Some(Instant::now());
+                        if index > 0 {
+                            to_swap.push(index);
+                        }
                         continue;
                     }
                 }
             }
         }
-    }
 
-    pub fn remove(&self, item: &Item<T>) {
-        self.items.write().unwrap().retain(|x| x != item);
+        // Perform removals and swaps
+        for index in to_remove.iter().rev() {
+            items.remove(*index);
+        }
+        for index in to_swap {
+            items.swap(index, index - 1);
+        }
     }
 }
 
@@ -101,33 +101,11 @@ pub struct Item<T: Clone> {
     pub timeout: Option<Duration>,
 
     // Internal
-    internal_priority: u64,
     submitted_at: Instant,
     last_escalation: Option<Instant>,
     batch_id: u64,
     was_restored: bool,
 }
-
-// Implement the Ord, PartialOrd, PartialEq, and Eq traits for Item
-impl<T: Ord + Clone> Ord for Item<T> {
-    fn cmp(&self, other: &Self) -> Ordering {
-        self.internal_priority.cmp(&other.internal_priority)
-    }
-}
-
-impl<T: Ord + Clone> PartialOrd for Item<T> {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-impl<T: PartialEq + Clone> PartialEq for Item<T> {
-    fn eq(&self, other: &Self) -> bool {
-        self.internal_priority == other.internal_priority
-    }
-}
-
-impl<T: PartialEq + Clone> Eq for Item<T> {}
 
 impl<T: Clone> Item<T> {
     // Constructor to initialize the struct
@@ -155,7 +133,6 @@ impl<T: Clone> Item<T> {
             last_escalation: None,
             batch_id: 0,
             was_restored: false,
-            internal_priority: 0,
         }
     }
 }
