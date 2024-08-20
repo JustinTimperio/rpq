@@ -8,7 +8,6 @@ extern crate scopeguard;
 
 mod bpq;
 mod pq;
-mod schema;
 
 struct RPQ<T: Ord + Clone> {
     // total_len is the number of items across all queues
@@ -18,42 +17,36 @@ struct RPQ<T: Ord + Clone> {
 
     // buckets is a map of priorities to a binary heap of items
     buckets: Arc<RwLock<HashMap<u64, pq::PriorityQueue<T>>>>,
+    items_in_queues: AtomicU64,
 }
 
 impl<T: Ord + Clone> RPQ<T> {
     fn new(bucket_count: u64) -> RPQ<T> {
         let buckets = Arc::new(RwLock::new(HashMap::new()));
+        let items_in_queues = AtomicU64::new(0);
 
         for i in 0..bucket_count {
-            buckets
-                .write()
-                .unwrap()
-                .insert(i, pq::PriorityQueue::new(bpq::BucketPriorityQueue::new()));
+            buckets.write().unwrap().insert(i, pq::PriorityQueue::new());
         }
 
         RPQ {
             bucket_count,
             non_empty_buckets: bpq::BucketPriorityQueue::new(),
             buckets,
+            items_in_queues,
         }
     }
 
     fn len(&self) -> u64 {
-        let mut total_len: u64 = 0;
-
-        for (_, queue) in self.buckets.read().unwrap().iter() {
-            total_len += queue.len();
-        }
-
-        total_len
+        self.items_in_queues.load(Ordering::Relaxed)
     }
 
-    fn peek(&self) -> Option<schema::Item<T>> {
+    fn peek(&self) -> Option<pq::Item<T>> {
         let bucket_id: u64 = self.non_empty_buckets.peek()?;
         self.buckets.read().unwrap().get(&bucket_id)?.peek()
     }
 
-    fn enqueue(&self, item: schema::Item<T>) {
+    fn enqueue(&self, item: pq::Item<T>) {
         let bucket_id: u64 = item.priority;
         self.buckets
             .read()
@@ -62,13 +55,15 @@ impl<T: Ord + Clone> RPQ<T> {
             .unwrap()
             .enqueue(item.clone());
         self.non_empty_buckets.add_bucket(bucket_id);
+        self.items_in_queues.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn dequeue(&self) -> Option<schema::Item<T>> {
+    fn dequeue(&self) -> Option<pq::Item<T>> {
         let bucket_id: u64 = self.non_empty_buckets.peek()?;
-        let item = self.buckets.read().unwrap().get(&bucket_id)?.dequeue()?;
+        let bucket = self.buckets.read().unwrap();
 
-        if self.buckets.read().unwrap().get(&bucket_id)?.len() == 0 {
+        let item = bucket.get(&bucket_id)?.dequeue()?;
+        if bucket.get(&bucket_id)?.len() == 0 {
             self.non_empty_buckets.remove_bucket(bucket_id);
         }
         Some(item)
@@ -76,8 +71,8 @@ impl<T: Ord + Clone> RPQ<T> {
 }
 
 fn main() {
-    let send_threads = 10;
-    let receive_threads = 1;
+    let send_threads = 20;
+    let receive_threads = 6;
     let bucket_count = 10;
     let rpq = Arc::new(RPQ::new(bucket_count));
 
@@ -90,7 +85,7 @@ fn main() {
         println!("Spawning thread {}", i);
         send_handles.push(std::thread::spawn(move || {
             for j in 0..10_000_000 / send_threads {
-                let item: schema::Item<u64> = schema::Item {
+                let item: pq::Item<u64> = pq::Item {
                     // Random priority between 0 and 9
                     priority: rand::thread_rng().gen_range(0..bucket_count),
                     data: j,
@@ -143,4 +138,5 @@ fn main() {
         handle.join().unwrap();
     }
     println!("Recived: {}", received.load(Ordering::Relaxed));
+    println!("Total: {}", rpq.len());
 }
