@@ -2,10 +2,7 @@ use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
 use uuid::Uuid;
-
-extern crate scopeguard;
 
 mod bpq;
 mod pq;
@@ -13,11 +10,12 @@ mod pq;
 struct RPQ<T: Ord + Clone> {
     // total_len is the number of items across all queues
     pub bucket_count: u64,
-    // non_empty_buckets is a binary heap of priorities
-    pub non_empty_buckets: bpq::BucketPriorityQueue,
 
+    // non_empty_buckets is a binary heap of priorities
+    non_empty_buckets: bpq::BucketPriorityQueue,
     // buckets is a map of priorities to a binary heap of items
     buckets: Arc<RwLock<HashMap<u64, pq::PriorityQueue<T>>>>,
+    // items_in_queues is the number of items across all queues
     items_in_queues: AtomicU64,
 }
 
@@ -43,19 +41,43 @@ impl<T: Ord + Clone> RPQ<T> {
     }
 
     fn peek(&self) -> Option<pq::Item<T>> {
-        let bucket_id: u64 = self.non_empty_buckets.peek()?;
-        self.buckets.read().unwrap().get(&bucket_id)?.peek()
+        // Fetch the bucket_id
+        let bucket_id = self.non_empty_buckets.peek();
+        if bucket_id.is_none() {
+            return None;
+        }
+        let bucket_id = bucket_id.unwrap();
+
+        // Fetch the queue
+        let queue = self.buckets.read().unwrap();
+        let queue = queue.get(&bucket_id);
+        if queue.is_none() {
+            return None;
+        }
+
+        // Peek the item
+        queue.unwrap().peek()
     }
 
     fn enqueue(&self, item: pq::Item<T>) {
-        let bucket_id: u64 = item.priority;
-        self.buckets
-            .read()
-            .unwrap()
-            .get(&bucket_id)
-            .unwrap()
-            .enqueue(item.clone());
-        self.non_empty_buckets.add_bucket(bucket_id);
+        // Check if the item priority is greater than the bucket count
+        if item.priority >= self.bucket_count {
+            println!("Item priority is greater than bucket count");
+            return;
+        }
+
+        // Get the bucket and enqueue the item
+        let buckets = self.buckets.read().unwrap();
+        let bucket = buckets.get(&item.priority);
+
+        if bucket.is_none() {
+            println!("Bucket is none for id: {}", item.priority);
+            return;
+        }
+
+        // Enqueue the item and update
+        bucket.unwrap().enqueue(item.clone());
+        self.non_empty_buckets.add_bucket(item.priority);
         self.items_in_queues.fetch_add(1, Ordering::Relaxed);
     }
 
@@ -63,15 +85,21 @@ impl<T: Ord + Clone> RPQ<T> {
         let buckets = self.buckets.read().unwrap();
 
         // Fetch the bucket
-        let bucket_id: u64 = self.non_empty_buckets.peek()?;
-        let bucket = buckets.get(&bucket_id);
-        if bucket.is_none() {
+        let bucket_id = self.non_empty_buckets.peek();
+        if bucket_id.is_none() {
+            return None;
+        }
+        let bucket_id = bucket_id.unwrap();
+
+        // Fetch the queue
+        let queue = buckets.get(&bucket_id);
+        if queue.is_none() {
             println!("Bucket is none for id: {}", bucket_id);
             return None;
         }
 
         // Fetch the item from the bucket
-        let item = bucket.unwrap().dequeue();
+        let item = queue.unwrap().dequeue();
         if item.is_none() {
             self.non_empty_buckets.remove_bucket(bucket_id);
             return None;
@@ -79,7 +107,7 @@ impl<T: Ord + Clone> RPQ<T> {
         self.items_in_queues.fetch_sub(1, Ordering::Relaxed);
 
         // If the bucket is empty, remove it from the non_empty_buckets
-        if bucket.unwrap().len() == 0 {
+        if queue.unwrap().len() == 0 {
             self.non_empty_buckets.remove_bucket(bucket_id);
         }
         return item;
@@ -87,11 +115,13 @@ impl<T: Ord + Clone> RPQ<T> {
 }
 
 fn main() {
-    // Set Conncurrency
-    let send_threads = 10;
+    // Set Message Count
+    let message_count = 10_000_000;
+
+    // Set Concurrency
+    let send_threads = 20;
     let receive_threads = 1;
     let bucket_count = 10;
-    let message_count = 10_000_000;
     let sent_counter = Arc::new(AtomicU64::new(0));
     let received_counter = Arc::new(AtomicU64::new(0));
 
@@ -104,31 +134,23 @@ fn main() {
         let rpq_clone = Arc::clone(&rpq);
         let sent_clone = Arc::clone(&sent_counter);
         println!("Spawning thread {}", i);
-        send_handles.push(std::thread::spawn(move || {
-            loop {
-                if sent_clone.load(Ordering::Relaxed) >= message_count {
-                    break;
-                }
-
-                let item: pq::Item<u64> = pq::Item {
-                    // Random priority between 0 and 9
-                    priority: rand::thread_rng().gen_range(0..bucket_count),
-                    data: 0,
-                    disk_uuid: Some(Uuid::new_v4().to_string()),
-                    should_escalate: false,
-                    escalation_rate: None,
-                    can_timeout: false,
-                    timeout: None,
-                    submitted_at: std::time::Instant::now(),
-                    last_escalation: None,
-                    index: 0,
-                    batch_id: 0,
-                    was_restored: false,
-                };
-
-                rpq_clone.enqueue(item);
-                sent_clone.fetch_add(1, Ordering::Relaxed);
+        send_handles.push(std::thread::spawn(move || loop {
+            if sent_clone.load(Ordering::Relaxed) >= message_count {
+                break;
             }
+
+            let item = pq::Item::new(
+                rand::thread_rng().gen_range(0..bucket_count),
+                0,
+                Some(Uuid::new_v4().to_string()),
+                false,
+                None,
+                false,
+                None,
+            );
+
+            rpq_clone.enqueue(item);
+            sent_clone.fetch_add(1, Ordering::Relaxed);
         }));
     }
 
@@ -152,16 +174,17 @@ fn main() {
         }));
     }
 
-    // Wait for all threads to finish
+    // Wait for send threads to finish
     for handle in send_handles {
         handle.join().unwrap();
     }
     println!("Sent: {}", sent_counter.load(Ordering::Relaxed));
 
-    // Wait for all threads to finish
+    // Wait for receive threads to finish
     for handle in receive_handles {
         handle.join().unwrap();
     }
     println!("Recived: {}", received_counter.load(Ordering::Relaxed));
+
     println!("Total: {}", rpq.len());
 }

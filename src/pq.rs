@@ -22,6 +22,14 @@ impl<T: Ord + Clone> PriorityQueue<T> {
     }
 
     pub fn enqueue(&self, item: Item<T>) {
+        let mut item = item;
+
+        // Set the internal fields
+        item.submitted_at = Instant::now();
+        item.last_escalation = None;
+        item.was_restored = false;
+
+        // Add the item to the queue
         self.items.write().unwrap().push(item);
     }
 
@@ -29,16 +37,54 @@ impl<T: Ord + Clone> PriorityQueue<T> {
         self.items.write().unwrap().pop()
     }
 
-    pub fn update_priority(&self, item: Item<T>, new_priority: u64) {
-        // Replace the item with the new priority
-        self.items.write().unwrap().retain(|x| x != &item);
-        let mut new_item: Item<T> = item;
-        new_item.priority = new_priority;
-        self.items.write().unwrap().push(new_item);
+    pub fn update_priority(&self, item: &Item<T>, new_priority: u64) {
+        // Create a clone of the item with the new priority
+        let mut item_clone = item.clone();
+        item_clone.priority = new_priority;
+        item_clone.last_escalation = Some(Instant::now());
+
+        // Remove the old item and insert the new item
+        let mut items = self.items.write().unwrap();
+        items.retain(|x| x != item);
+        items.push(item_clone);
     }
 
-    pub fn remove(&self, item: Item<T>) {
-        self.items.write().unwrap().retain(|x| x != &item);
+    pub fn prioritize(&self) {
+        let items = self.items.write().unwrap();
+        for item in items.iter() {
+            // Timeout items that have been in the queue for too long
+            if item.can_timeout {
+                if item.timeout.unwrap().as_secs() > item.submitted_at.elapsed().as_secs() {
+                    self.remove(item);
+                    continue;
+                }
+            }
+
+            // Escalate items that have been in the queue for too long
+            if item.should_escalate {
+                // Check if we have ever escalated this item
+                if item.last_escalation.is_none() {
+                    if item.escalation_rate.unwrap().as_secs()
+                        > item.submitted_at.elapsed().as_secs()
+                    {
+                        self.update_priority(item, item.priority + 1);
+                        continue;
+                    }
+                } else {
+                    // Check if we need to escalate this item again
+                    if item.escalation_rate.unwrap().as_secs()
+                        > item.last_escalation.unwrap().elapsed().as_secs()
+                    {
+                        self.update_priority(item, item.priority + 1);
+                        continue;
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn remove(&self, item: &Item<T>) {
+        self.items.write().unwrap().retain(|x| x != item);
     }
 }
 
@@ -55,18 +101,17 @@ pub struct Item<T: Clone> {
     pub timeout: Option<Duration>,
 
     // Internal
-    pub submitted_at: Instant,
-    pub last_escalation: Option<Instant>,
-    pub index: u64,
-    pub batch_id: u64,
-    pub was_restored: bool,
+    internal_priority: u64,
+    submitted_at: Instant,
+    last_escalation: Option<Instant>,
+    batch_id: u64,
+    was_restored: bool,
 }
 
 // Implement the Ord, PartialOrd, PartialEq, and Eq traits for Item
-// Why do we need to implement these traits?
 impl<T: Ord + Clone> Ord for Item<T> {
     fn cmp(&self, other: &Self) -> Ordering {
-        self.priority.cmp(&other.priority)
+        self.internal_priority.cmp(&other.internal_priority)
     }
 }
 
@@ -78,8 +123,39 @@ impl<T: Ord + Clone> PartialOrd for Item<T> {
 
 impl<T: PartialEq + Clone> PartialEq for Item<T> {
     fn eq(&self, other: &Self) -> bool {
-        self.priority == other.priority
+        self.internal_priority == other.internal_priority
     }
 }
 
 impl<T: PartialEq + Clone> Eq for Item<T> {}
+
+impl<T: Clone> Item<T> {
+    // Constructor to initialize the struct
+    pub fn new(
+        priority: u64,
+        data: T,
+        disk_uuid: Option<String>,
+        should_escalate: bool,
+        escalation_rate: Option<Duration>,
+        can_timeout: bool,
+        timeout: Option<Duration>,
+    ) -> Self {
+        Item {
+            // User-provided fields
+            priority,
+            data,
+            disk_uuid,
+            should_escalate,
+            escalation_rate,
+            can_timeout,
+            timeout,
+
+            // Internal fields
+            submitted_at: Instant::now(),
+            last_escalation: None,
+            batch_id: 0,
+            was_restored: false,
+            internal_priority: 0,
+        }
+    }
+}
