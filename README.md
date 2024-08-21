@@ -7,30 +7,34 @@
 </h4>
 
 
-## Table of Contents
-1. [Table of Contents](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#table-of-contents)
-2. [Background](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#background)
-4. [Benchmarks](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#benchmarks)
-3. [Usage](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#usage)
-5. [Contributing](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#contributing)
-6. [License](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#license)
+- [Background](#background)
+  - [Sister Projects](#sister-projects)
+- [Benchmarks](#benchmarks)
+- [Usage](#usage)
+  - [API Reference](#api-reference)
+    - [Example Usage](#example-usage)
+- [Contributing](#contributing)
+  - [We Develop with Github](#we-develop-with-github)
+  - [All Code Changes Happen Through Pull Requests](#all-code-changes-happen-through-pull-requests)
+  - [Any contributions you make will be under the MIT Software License](#any-contributions-you-make-will-be-under-the-mit-software-license)
+  - [Report bugs using Github's Issues](#report-bugs-using-githubs-issues)
+  - [Write bug reports with detail, background, and sample code](#write-bug-reports-with-detail-background-and-sample-code)
+- [License](#license)
+
 
 ## Background
+RPQ was written as an experiment when I was playing with [Fibonacci Heaps](https://en.wikipedia.org/wiki/Fibonacci_heap) and wanted to find something faster. I was disappointed by the state of research and libraries being used by most common applications, so RPQ is meant to be a highly flexible framework that can support a multitude of workloads.
 
-#### Other Priority Queues I'm Working On
+### Sister Projects 
 - [fibheap (Fibonacci Heaps)](https://github.com/JustinTimperio/fibheap)
 - [gpq (Go Priority Queue)](https://github.com/JustinTimperio/gpq)
-- [rpq (Rust Priority Queue)](https://github.com/JustinTimperio/rpq)
+- [pq-bench (Priority Queue Benchmarks)](https://github.com/JustinTimperio/pq-bench)
 
 ## Benchmarks
 
 ![profile](./docs/flamegraph.svg)
 
 ## Usage
-
-### Prerequisites 
-
-### Import Directly
 
 ### API Reference
 

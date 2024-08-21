@@ -1,11 +1,11 @@
 use std::time::{Duration, Instant};
 use std::{collections::VecDeque, sync::RwLock};
 
-pub struct PriorityQueue<T: Ord + Clone> {
+pub struct PriorityQueue<T: Ord> {
     items: RwLock<VecDeque<Item<T>>>,
 }
 
-impl<T: Ord + Clone> PriorityQueue<T> {
+impl<T: Ord> PriorityQueue<T> {
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
             items: RwLock::new(VecDeque::new()),
@@ -30,10 +30,6 @@ impl<T: Ord + Clone> PriorityQueue<T> {
 
     pub fn dequeue(&self) -> Option<Item<T>> {
         self.items.write().unwrap().pop_front()
-    }
-
-    pub fn peek(&self) -> Option<Item<T>> {
-        self.items.read().unwrap().front().cloned()
     }
 
     pub fn prioritize(&self) -> Option<(u64, u64)> {
@@ -94,8 +90,7 @@ impl<T: Ord + Clone> PriorityQueue<T> {
 }
 
 // Item is a struct that holds the data and metadata for an item in the queue
-#[derive(Clone)]
-pub struct Item<T: Clone> {
+pub struct Item<T> {
     // User
     pub priority: u64,
     pub data: T,
@@ -112,7 +107,7 @@ pub struct Item<T: Clone> {
     was_restored: bool,
 }
 
-impl<T: Clone> Item<T> {
+impl<T> Item<T> {
     // Constructor to initialize the struct
     pub fn new(
         priority: u64,

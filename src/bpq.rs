@@ -29,7 +29,7 @@ impl BucketPriorityQueue {
         self.bucket_ids.write().unwrap().insert(bucket_id);
     }
 
-    pub fn remove_bucket(&self, bucket_id: u64) {
+    pub fn remove_bucket(&self, bucket_id: &u64) {
         self.bucket_ids.write().unwrap().remove(&bucket_id);
     }
 }
