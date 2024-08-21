@@ -7,32 +7,49 @@
 </h4>
 
 
-## Table of Contents
-1. [Table of Contents](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#table-of-contents)
-2. [Background](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#background)
-4. [Benchmarks](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#benchmarks)
-3. [Usage](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#usage)
-5. [Contributing](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#contributing)
-6. [License](https://github.com/JustinTimperio/rpq?tab=readme-ov-file#license)
+- [Background](#background)
+  - [Should I Use RPQ?](#should-i-use-rpq)
+  - [Sister Projects](#sister-projects)
+- [Benchmarks](#benchmarks)
+- [Usage](#usage)
+  - [API Reference](#api-reference)
+    - [Example Usage](#example-usage)
+- [Contributing](#contributing)
+  - [We Develop with Github](#we-develop-with-github)
+  - [All Code Changes Happen Through Pull Requests](#all-code-changes-happen-through-pull-requests)
+  - [Any contributions you make will be under the MIT Software License](#any-contributions-you-make-will-be-under-the-mit-software-license)
+  - [Report bugs using Github's Issues](#report-bugs-using-githubs-issues)
+  - [Write bug reports with detail, background, and sample code](#write-bug-reports-with-detail-background-and-sample-code)
+- [License](#license)
+
 
 ## Background
+RPQ was written as an experiment when I was playing with [Fibonacci Heaps](https://en.wikipedia.org/wiki/Fibonacci_heap) and wanted to find something faster. I was disappointed by the state of research and libraries being used by most common applications, so RPQ is meant to be a highly flexible framework that can support a multitude of workloads.
 
-#### Other Priority Queues I'm Working On
+### Should I Use RPQ?
+GPQ is a concurrency safe, embeddable priority queue that can be used in a variety of applications. RPQ might be the right choice if:
+- Your data requires strict ordering guarantees
+- You need to prioritize items that are in the queue too long 
+- You need to timeout items
+- You have multiple writers and readers that need to access the queue concurrently
+- You run critical workloads and need to store the queue on disk in case of a crash
+
+### Sister Projects 
 - [fibheap (Fibonacci Heaps)](https://github.com/JustinTimperio/fibheap)
 - [gpq (Go Priority Queue)](https://github.com/JustinTimperio/gpq)
-- [rpq (Rust Priority Queue)](https://github.com/JustinTimperio/rpq)
+- [pq-bench (Priority Queue Benchmarks)](https://github.com/JustinTimperio/pq-bench)
 
 ## Benchmarks
+TODO
 
 ## Usage
-
-### Prerequisites 
-
-### Import Directly
+TODO
 
 ### API Reference
+TODO
 
 #### Example Usage
+TODO
 
 
 ## Contributing
@@ -71,8 +88,6 @@ We use GitHub issues to track public bugs. Report a bug by opening a new issue; 
 - What actually happens
 - Notes (possibly including why you think this might be happening, or stuff you tried that didn't work)
 
-### License
-By contributing, you agree that your contributions will be licensed under its MIT License.
 
 ## License
-All code here was originally written by me, Justin Timperio, under an MIT license with the exception of some code directly forked under a BSD license from the Go maintainers.
+All code here was originally written by me, Justin Timperio, under an MIT license.

@@ -2,8 +2,20 @@
 name = "rpq"
 version = "0.1.0"
 edition = "2021"
+authors = ["Justin Timperio"]
+description = "A high performance embeddable double priority queue with complex priority ordering guarantees"
+license = "MIT"
+readme = "README.md"
+repository = "https://github.com/JustinTimperio/rpq"
 
-# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+[lib]
+name = "rpq"
+path = "src/lib.rs"
 
 [dependencies]
+flamegraph = "0.6.5"
 rand = "0.8.4"
+uuid = { version = "1.10.0", features = ["v4"] }
+
+[profile.test]
+inherits = "release"
