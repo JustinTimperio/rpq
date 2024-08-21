@@ -8,6 +8,7 @@
 
 
 - [Background](#background)
+  - [Should I Use RPQ?](#should-i-use-rpq)
   - [Sister Projects](#sister-projects)
 - [Benchmarks](#benchmarks)
 - [Usage](#usage)
@@ -25,20 +26,30 @@
 ## Background
 RPQ was written as an experiment when I was playing with [Fibonacci Heaps](https://en.wikipedia.org/wiki/Fibonacci_heap) and wanted to find something faster. I was disappointed by the state of research and libraries being used by most common applications, so RPQ is meant to be a highly flexible framework that can support a multitude of workloads.
 
+### Should I Use RPQ?
+GPQ is a concurrency safe, embeddable priority queue that can be used in a variety of applications. RPQ might be the right choice if:
+- Your data requires strict ordering guarantees
+- You need to prioritize items that are in the queue too long 
+- You need to timeout items
+- You have multiple writers and readers that need to access the queue concurrently
+- You run critical workloads and need to store the queue on disk in case of a crash
+
 ### Sister Projects 
 - [fibheap (Fibonacci Heaps)](https://github.com/JustinTimperio/fibheap)
 - [gpq (Go Priority Queue)](https://github.com/JustinTimperio/gpq)
 - [pq-bench (Priority Queue Benchmarks)](https://github.com/JustinTimperio/pq-bench)
 
 ## Benchmarks
-
-![profile](./docs/flamegraph.svg)
+TODO
 
 ## Usage
+TODO
 
 ### API Reference
+TODO
 
 #### Example Usage
+TODO
 
 
 ## Contributing
