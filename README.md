@@ -75,4 +75,4 @@ We use GitHub issues to track public bugs. Report a bug by opening a new issue; 
 
 
 ## License
-All code here was originally written by me, Justin Timperio, under an MIT license with the exception of some code directly forked under a BSD license from the Go maintainers.
+All code here was originally written by me, Justin Timperio, under an MIT license.

@@ -36,7 +36,7 @@ impl<T: Ord + Clone> PriorityQueue<T> {
         self.items.read().unwrap().front().cloned()
     }
 
-    pub fn prioritize(&self) {
+    pub fn prioritize(&self) -> Option<(u64, u64)> {
         let mut items = self.items.write().unwrap();
         let mut to_remove = Vec::new();
         let mut to_swap = Vec::new();
@@ -44,7 +44,7 @@ impl<T: Ord + Clone> PriorityQueue<T> {
         for (index, item) in items.iter_mut().enumerate() {
             // Timeout items that have been in the queue for too long
             if item.can_timeout {
-                if item.timeout.unwrap().as_secs() > item.submitted_at.elapsed().as_secs() {
+                if item.timeout.unwrap().as_secs() < item.submitted_at.elapsed().as_secs() {
                     to_remove.push(index);
                     continue;
                 }
@@ -61,22 +61,25 @@ impl<T: Ord + Clone> PriorityQueue<T> {
                         if index > 0 {
                             to_swap.push(index);
                         }
-                        continue;
                     }
-                } else {
-                    // Check if we need to escalate this item again
-                    if item.escalation_rate.unwrap().as_secs()
-                        > item.last_escalation.unwrap().elapsed().as_secs()
-                    {
-                        item.last_escalation = Some(Instant::now());
-                        if index > 0 {
-                            to_swap.push(index);
-                        }
-                        continue;
+                    continue;
+                }
+
+                // Check if we need to escalate this item again
+                if item.escalation_rate.unwrap().as_secs()
+                    > item.last_escalation.unwrap().elapsed().as_secs()
+                {
+                    item.last_escalation = Some(Instant::now());
+                    if index > 0 {
+                        to_swap.push(index);
                     }
+                    continue;
                 }
             }
         }
+
+        let removed = to_remove.len();
+        let swapped = to_swap.len();
 
         // Perform removals and swaps
         for index in to_remove.iter().rev() {
@@ -85,6 +88,8 @@ impl<T: Ord + Clone> PriorityQueue<T> {
         for index in to_swap {
             items.swap(index, index - 1);
         }
+
+        return Some((removed as u64, swapped as u64));
     }
 }
 

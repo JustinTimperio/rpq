@@ -1,3 +1,4 @@
+use core::time;
 use rand::Rng;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -87,7 +88,6 @@ impl<T: Ord + Clone> RPQ<T> {
         // Fetch the bucket
         let bucket_id = self.non_empty_buckets.peek();
         if bucket_id.is_none() {
-            println!("Bucket id is none");
             return None;
         }
         let bucket_id = bucket_id.unwrap();
@@ -110,6 +110,22 @@ impl<T: Ord + Clone> RPQ<T> {
         }
         return item;
     }
+
+    fn prioritize(&self) -> Option<(u64, u64)> {
+        let mut removed = 0;
+        let mut escalated = 0;
+
+        for (_, active_bucket) in self.buckets.read().unwrap().iter() {
+            let results = active_bucket.prioritize();
+            if results.is_none() {
+                continue;
+            }
+            removed += results.unwrap().0;
+            escalated += results.unwrap().1;
+        }
+        self.items_in_queues.fetch_sub(removed, Ordering::Relaxed);
+        return Some((removed, escalated));
+    }
 }
 
 fn main() {
@@ -117,21 +133,21 @@ fn main() {
     let message_count = 10_000_000;
 
     // Set Concurrency
-    let send_threads = 30;
+    let send_threads = 20;
     let receive_threads = 1;
     let bucket_count = 10;
     let sent_counter = Arc::new(AtomicU64::new(0));
     let received_counter = Arc::new(AtomicU64::new(0));
+    let removed_counter = Arc::new(AtomicU64::new(0));
 
     // Create the RPQ
     let rpq = Arc::new(RPQ::new(bucket_count));
 
     // Enqueue items
     let mut send_handles = Vec::new();
-    for i in 0..send_threads {
+    for _i in 0..send_threads {
         let rpq_clone = Arc::clone(&rpq);
         let sent_clone = Arc::clone(&sent_counter);
-        println!("Spawning thread {}", i);
         send_handles.push(std::thread::spawn(move || loop {
             if sent_clone.load(Ordering::Relaxed) >= message_count {
                 break;
@@ -143,8 +159,8 @@ fn main() {
                 Some(Uuid::new_v4().to_string()),
                 false,
                 None,
-                false,
-                None,
+                true,
+                Some(std::time::Duration::from_secs(5)),
             );
 
             rpq_clone.enqueue(item);
@@ -154,16 +170,19 @@ fn main() {
 
     // Dequeue items
     let mut receive_handles = Vec::new();
-    for i in 0..receive_threads {
-        println!("Spawning dequeue thread {}", i);
+    for _i in 0..receive_threads {
+        // Clone all the shared variables
         let rpq_clone = Arc::clone(&rpq);
         let recived_clone = Arc::clone(&received_counter);
         let sent_clone = Arc::clone(&sent_counter);
+        let removed_clone = Arc::clone(&removed_counter);
+
+        // Spawn the thread
         receive_handles.push(std::thread::spawn(move || loop {
-            if recived_clone.load(Ordering::Relaxed) >= message_count {
-                if sent_clone.load(Ordering::Relaxed) == recived_clone.load(Ordering::Relaxed) {
-                    break;
-                }
+            if sent_clone.load(Ordering::Relaxed)
+                == (recived_clone.load(Ordering::Relaxed) + removed_clone.load(Ordering::Relaxed))
+            {
+                break;
             }
 
             let item = rpq_clone.dequeue();
@@ -174,6 +193,19 @@ fn main() {
             recived_clone.fetch_add(1, Ordering::Relaxed);
         }));
     }
+
+    let rpq_clone = Arc::clone(&rpq);
+    let removed_clone = Arc::clone(&removed_counter);
+    std::thread::spawn(move || loop {
+        let results = rpq_clone.prioritize();
+        if !results.is_none() {
+            let (removed, escalated) = results.unwrap();
+            removed_clone.fetch_add(removed, Ordering::Relaxed);
+            println!("Removed: {}, Escalated: {}", removed, escalated);
+        }
+
+        std::thread::sleep(time::Duration::from_secs(1));
+    });
 
     // Wait for send threads to finish
     for handle in send_handles {
