@@ -4,19 +4,13 @@ use std::{collections::VecDeque, sync::RwLock};
 use bincode::{deserialize, serialize};
 use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
-pub struct PriorityQueue<T: Ord>
-where
-    T: Serialize + DeserializeOwned,
-{
+pub struct PriorityQueue<T: Ord + Clone> {
     items: RwLock<VecDeque<Item<T>>>,
 }
 
-impl<T: Ord> PriorityQueue<T>
-where
-    T: Serialize + DeserializeOwned,
-{
+impl<T: Ord + Clone> PriorityQueue<T> {
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
             items: RwLock::new(VecDeque::new()),
@@ -107,10 +101,8 @@ where
 }
 
 // Item is a struct that holds the data and metadata for an item in the queue
-pub struct Item<T>
-where
-    T: Serialize + DeserializeOwned,
-{
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Item<T: Clone> {
     // User
     pub priority: u64,
     pub data: T,
@@ -127,10 +119,7 @@ where
     was_restored: bool,
 }
 
-impl<T> Item<T>
-where
-    T: Serialize + DeserializeOwned,
-{
+impl<T: Clone> Item<T> {
     // Constructor to initialize the struct
     pub fn new(
         priority: u64,
@@ -159,11 +148,25 @@ where
         }
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Self {
+    pub fn set_restored(&mut self) {
+        self.was_restored = true;
+    }
+
+    pub fn was_restored(&self) -> bool {
+        self.was_restored
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self
+    where
+        T: Serialize + DeserializeOwned,
+    {
         deserialize(bytes).unwrap()
     }
 
-    pub fn to_bytes(&self) -> Vec<u8> {
+    pub fn to_bytes(&self) -> Vec<u8>
+    where
+        T: Serialize + DeserializeOwned,
+    {
         serialize(&self).unwrap()
     }
 }

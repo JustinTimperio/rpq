@@ -1,19 +1,17 @@
 use core::time;
 use serde::de::DeserializeOwned;
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, RwLock};
+use std::sync::mpsc::{channel, Receiver, Sender};
+use std::sync::{Arc, Mutex, RwLock};
 
 use redb::{Database, TableDefinition};
 
 mod bpq;
 mod pq;
 
-pub struct RPQ<T: Ord>
-where
-    T: Serialize + DeserializeOwned,
-{
+pub struct RPQ<T: Ord + Clone> {
     // options is the configuration for the RPQ
     options: RPQOptions,
     // non_empty_buckets is a binary heap of priorities
@@ -24,6 +22,14 @@ where
     items_in_queues: AtomicU64,
     // disk_cache maintains a cache of items that are in the queue
     disk_cache: Arc<Database>,
+    // lazy_disk_channel is the channel for lazy disk writes
+    lazy_disk_writer_sender: Mutex<Sender<pq::Item<T>>>,
+    // lazy_disk_reader is the receiver for lazy disk writes
+    lazy_disk_writer_receiver: Mutex<Receiver<pq::Item<T>>>,
+    // lazy_disk_delete_sender is the sender for lazy disk deletes
+    lazy_disk_delete_sender: Mutex<Sender<pq::Item<T>>>,
+    // lazy_disk_delete_receiver is the receiver for lazy disk deletes
+    lazy_disk_delete_receiver: Mutex<Receiver<pq::Item<T>>>,
 }
 
 pub struct RPQOptions {
@@ -41,19 +47,26 @@ pub struct RPQOptions {
     pub lazy_disk_cache_batch_size: u64,
 }
 
-impl<T: Ord> RPQ<T>
+impl<T: Ord + Clone> RPQ<T>
 where
     T: Serialize + DeserializeOwned,
 {
     pub fn new(options: RPQOptions) -> RPQ<T> {
+        // Create base structures
         let buckets = Arc::new(RwLock::new(HashMap::new()));
         let items_in_queues = AtomicU64::new(0);
-        let db: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
 
+        // Create the lazy disk sync channel
+        let (lazy_disk_writer_sender, lazy_disk_writer_receiver) = channel();
+        let (lazy_disk_delete_sender, lazy_disk_delete_receiver) = channel();
+
+        // Create the buckets
+        let db: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
         for i in 0..options.bucket_count {
             buckets.write().unwrap().insert(i, pq::PriorityQueue::new());
         }
 
+        // Create the disk cache
         let path = options.database_path.clone();
         let disk_cache = Arc::new(Database::create(path).unwrap());
 
@@ -61,14 +74,17 @@ where
         if options.disk_cache_enabled {
             let read_txn = disk_cache.begin_read().unwrap();
             let table = read_txn.open_table(db).unwrap();
-            let cursor = table.range::<&str>(..);
+            let mut cursor = table.range::<&str>(..);
 
-            for entry in cursor.iter() {
+            for entry in cursor.iter_mut() {
                 match entry.next() {
-                    Some(Ok((key, value))) => {
-                        let item = pq::Item::from_bytes(value.value());
+                    Some(Ok((_key, value))) => {
+                        let mut item = pq::Item::from_bytes(value.value());
+                        // Mark the item as restored
+                        item.set_restored();
 
-                        let bucket = buckets.read().unwrap().get(&item.priority);
+                        let buckets = buckets.write().unwrap();
+                        let bucket = buckets.get(&item.priority);
                         if bucket.is_none() {
                             continue;
                         }
@@ -92,11 +108,19 @@ where
             buckets,
             items_in_queues,
             disk_cache,
+            lazy_disk_writer_sender: Mutex::new(lazy_disk_writer_sender),
+            lazy_disk_writer_receiver: Mutex::new(lazy_disk_writer_receiver),
+            lazy_disk_delete_sender: Mutex::new(lazy_disk_delete_sender),
+            lazy_disk_delete_receiver: Mutex::new(lazy_disk_delete_receiver),
         }
     }
 
     pub fn len(&self) -> u64 {
         self.items_in_queues.load(Ordering::Relaxed)
+    }
+
+    pub fn active_buckets(&self) -> u64 {
+        self.non_empty_buckets.len()
     }
 
     pub fn enqueue(&self, item: pq::Item<T>) {
@@ -114,6 +138,19 @@ where
         if bucket.is_none() {
             println!("Bucket is none for id: {}", priority);
             return;
+        }
+
+        // If the disk cache is enabled, send the item to the lazy disk writer
+        if self.options.disk_cache_enabled {
+            if item.was_restored() {
+                return;
+            }
+            let lazy_disk_writer_sender = self.lazy_disk_writer_sender.lock().unwrap();
+            let was_sent = lazy_disk_writer_sender.send(item.clone());
+            if was_sent.is_err() {
+                println!("Error sending item to lazy disk writer");
+                return;
+            }
         }
 
         // Enqueue the item and update
@@ -148,6 +185,16 @@ where
         if queue.unwrap().len() == 0 {
             self.non_empty_buckets.remove_bucket(&bucket_id);
         }
+
+        if self.options.disk_cache_enabled {
+            let lazy_disk_delete_sender = self.lazy_disk_delete_sender.lock().unwrap();
+            let was_sent = lazy_disk_delete_sender.send(item.clone().unwrap());
+            if was_sent.is_err() {
+                println!("Error sending item to lazy disk delete");
+                return None;
+            }
+        }
+
         return item;
     }
 
@@ -165,6 +212,26 @@ where
         }
         self.items_in_queues.fetch_sub(removed, Ordering::Relaxed);
         return Some((removed, escalated));
+    }
+
+    pub fn lazy_disk_writer(&self) {
+        loop {
+            let item = self.lazy_disk_writer_receiver.lock().unwrap().recv();
+            if item.is_err() {
+                println!("Error receiving item from lazy disk writer");
+                continue;
+            }
+        }
+    }
+
+    pub fn lazy_disk_deleter(&self) {
+        loop {
+            let item = self.lazy_disk_delete_receiver.lock().unwrap().recv();
+            if item.is_err() {
+                println!("Error receiving item from lazy disk delete");
+                continue;
+            }
+        }
     }
 }
 
@@ -193,8 +260,8 @@ mod tests {
             disk_cache_enabled: false,
             database_path: "rpq".to_string(),
             lazy_disk_cache: false,
-            lazy_disk_max_delay: time::Duration::from_secs(1),
-            lazy_disk_cache_batch_size: 100,
+            lazy_disk_max_delay: time::Duration::from_secs(5),
+            lazy_disk_cache_batch_size: 1000,
         };
         let rpq = Arc::new(RPQ::new(options));
 
