@@ -1,46 +1,107 @@
+use core::time;
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, RwLock};
 
+use redb::{Database, TableDefinition};
+
 mod bpq;
 mod pq;
 
-struct RPQ<T: Ord> {
-    // total_len is the number of items across all queues
-    pub bucket_count: u64,
-
+pub struct RPQ<T: Ord>
+where
+    T: Serialize + DeserializeOwned,
+{
+    // options is the configuration for the RPQ
+    options: RPQOptions,
     // non_empty_buckets is a binary heap of priorities
     non_empty_buckets: bpq::BucketPriorityQueue,
     // buckets is a map of priorities to a binary heap of items
     buckets: Arc<RwLock<HashMap<u64, pq::PriorityQueue<T>>>>,
     // items_in_queues is the number of items across all queues
     items_in_queues: AtomicU64,
+    // disk_cache maintains a cache of items that are in the queue
+    disk_cache: Arc<Database>,
 }
 
-impl<T: Ord> RPQ<T> {
-    fn new(bucket_count: u64) -> RPQ<T> {
+pub struct RPQOptions {
+    // bucket_count is the number of buckets in the RPQ
+    pub bucket_count: u64,
+    // disk_cache_enabled is a flag to enable or disable the disk cache
+    pub disk_cache_enabled: bool,
+    // disk_cache_path is the path to the disk cache
+    pub database_path: String,
+    // disk_cache_max_size is the maximum size of the disk cache
+    pub lazy_disk_cache: bool,
+    // lazy_disk_max_delay is the maximum delay for lazy disk writes
+    pub lazy_disk_max_delay: time::Duration,
+    // lazy_disk_cache_batch_size is the maximum batch size for lazy disk writes
+    pub lazy_disk_cache_batch_size: u64,
+}
+
+impl<T: Ord> RPQ<T>
+where
+    T: Serialize + DeserializeOwned,
+{
+    pub fn new(options: RPQOptions) -> RPQ<T> {
         let buckets = Arc::new(RwLock::new(HashMap::new()));
         let items_in_queues = AtomicU64::new(0);
+        let db: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
 
-        for i in 0..bucket_count {
+        for i in 0..options.bucket_count {
             buckets.write().unwrap().insert(i, pq::PriorityQueue::new());
         }
 
+        let path = options.database_path.clone();
+        let disk_cache = Arc::new(Database::create(path).unwrap());
+
+        // If the disk cache is enabled, load the items from the disk cache
+        if options.disk_cache_enabled {
+            let read_txn = disk_cache.begin_read().unwrap();
+            let table = read_txn.open_table(db).unwrap();
+            let cursor = table.range::<&str>(..);
+
+            for entry in cursor.iter() {
+                match entry.next() {
+                    Some(Ok((key, value))) => {
+                        let item = pq::Item::from_bytes(value.value());
+
+                        let bucket = buckets.read().unwrap().get(&item.priority);
+                        if bucket.is_none() {
+                            continue;
+                        }
+
+                        bucket.unwrap().enqueue(item);
+                    }
+                    Some(Err(e)) => {
+                        println!("Error reading from disk cache: {}", e);
+                        continue;
+                    }
+                    None => {
+                        break;
+                    }
+                }
+            }
+        }
+
         RPQ {
-            bucket_count,
+            options,
             non_empty_buckets: bpq::BucketPriorityQueue::new(),
             buckets,
             items_in_queues,
+            disk_cache,
         }
     }
 
-    fn len(&self) -> u64 {
+    pub fn len(&self) -> u64 {
         self.items_in_queues.load(Ordering::Relaxed)
     }
 
-    fn enqueue(&self, item: pq::Item<T>) {
+    pub fn enqueue(&self, item: pq::Item<T>) {
         // Check if the item priority is greater than the bucket count
-        if item.priority >= self.bucket_count {
+        if item.priority >= self.options.bucket_count {
             println!("Item priority is greater than bucket count");
             return;
         }
@@ -61,7 +122,7 @@ impl<T: Ord> RPQ<T> {
         self.items_in_queues.fetch_add(1, Ordering::Relaxed);
     }
 
-    fn dequeue(&self) -> Option<pq::Item<T>> {
+    pub fn dequeue(&self) -> Option<pq::Item<T>> {
         let buckets = self.buckets.read().unwrap();
 
         // Fetch the bucket
@@ -90,7 +151,7 @@ impl<T: Ord> RPQ<T> {
         return item;
     }
 
-    fn prioritize(&self) -> Option<(u64, u64)> {
+    pub fn prioritize(&self) -> Option<(u64, u64)> {
         let mut removed = 0;
         let mut escalated = 0;
 
@@ -127,7 +188,15 @@ mod tests {
         let removed_counter = Arc::new(AtomicU64::new(0));
 
         // Create the RPQ
-        let rpq = Arc::new(RPQ::new(bucket_count));
+        let options = RPQOptions {
+            bucket_count,
+            disk_cache_enabled: false,
+            database_path: "rpq".to_string(),
+            lazy_disk_cache: false,
+            lazy_disk_max_delay: time::Duration::from_secs(1),
+            lazy_disk_cache_batch_size: 100,
+        };
+        let rpq = Arc::new(RPQ::new(options));
 
         // Launch the monitoring thread
         let rpq_clone = Arc::clone(&rpq);
@@ -157,6 +226,7 @@ mod tests {
             );
             std::thread::sleep(time::Duration::from_secs(1));
         });
+
         // Enqueue items
         println!("Launching {} Send Threads", send_threads);
         let mut send_handles = Vec::new();

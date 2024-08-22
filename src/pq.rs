@@ -1,11 +1,22 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{collections::VecDeque, sync::RwLock};
 
-pub struct PriorityQueue<T: Ord> {
+use bincode::{deserialize, serialize};
+use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
+use serde::Serialize;
+
+pub struct PriorityQueue<T: Ord>
+where
+    T: Serialize + DeserializeOwned,
+{
     items: RwLock<VecDeque<Item<T>>>,
 }
 
-impl<T: Ord> PriorityQueue<T> {
+impl<T: Ord> PriorityQueue<T>
+where
+    T: Serialize + DeserializeOwned,
+{
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
             items: RwLock::new(VecDeque::new()),
@@ -20,7 +31,7 @@ impl<T: Ord> PriorityQueue<T> {
         let mut item = item;
 
         // Set the internal fields
-        item.submitted_at = Instant::now();
+        item.submitted_at = Utc::now();
         item.last_escalation = None;
         item.was_restored = false;
 
@@ -40,7 +51,10 @@ impl<T: Ord> PriorityQueue<T> {
         for (index, item) in items.iter_mut().enumerate() {
             // Timeout items that have been in the queue for too long
             if item.can_timeout {
-                if item.timeout.unwrap().as_secs() < item.submitted_at.elapsed().as_secs() {
+                if item.timeout.unwrap().as_millis()
+                    >= (Utc::now().timestamp_millis() - item.submitted_at.timestamp_millis())
+                        as u128
+                {
                     to_remove.push(index);
                     continue;
                 }
@@ -50,10 +64,11 @@ impl<T: Ord> PriorityQueue<T> {
             if item.should_escalate {
                 // Check if we have ever escalated this item
                 if item.last_escalation.is_none() {
-                    if item.escalation_rate.unwrap().as_secs()
-                        > item.submitted_at.elapsed().as_secs()
+                    if item.escalation_rate.unwrap().as_millis()
+                        > (Utc::now().timestamp_millis() - item.submitted_at.timestamp_millis())
+                            as u128
                     {
-                        item.last_escalation = Some(Instant::now());
+                        item.last_escalation = Some(Utc::now());
                         if index > 0 {
                             to_swap.push(index);
                         }
@@ -62,10 +77,12 @@ impl<T: Ord> PriorityQueue<T> {
                 }
 
                 // Check if we need to escalate this item again
-                if item.escalation_rate.unwrap().as_secs()
-                    > item.last_escalation.unwrap().elapsed().as_secs()
+                if item.escalation_rate.unwrap().as_millis()
+                    >= (Utc::now().timestamp_millis()
+                        - item.last_escalation.unwrap().timestamp_millis())
+                        as u128
                 {
-                    item.last_escalation = Some(Instant::now());
+                    item.last_escalation = Some(Utc::now());
                     if index > 0 {
                         to_swap.push(index);
                     }
@@ -90,7 +107,10 @@ impl<T: Ord> PriorityQueue<T> {
 }
 
 // Item is a struct that holds the data and metadata for an item in the queue
-pub struct Item<T> {
+pub struct Item<T>
+where
+    T: Serialize + DeserializeOwned,
+{
     // User
     pub priority: u64,
     pub data: T,
@@ -101,13 +121,16 @@ pub struct Item<T> {
     pub timeout: Option<Duration>,
 
     // Internal
-    submitted_at: Instant,
-    last_escalation: Option<Instant>,
+    submitted_at: DateTime<Utc>,
+    last_escalation: Option<DateTime<Utc>>,
     batch_id: u64,
     was_restored: bool,
 }
 
-impl<T> Item<T> {
+impl<T> Item<T>
+where
+    T: Serialize + DeserializeOwned,
+{
     // Constructor to initialize the struct
     pub fn new(
         priority: u64,
@@ -129,10 +152,18 @@ impl<T> Item<T> {
             timeout,
 
             // Internal fields
-            submitted_at: Instant::now(),
+            submitted_at: Utc::now(),
             last_escalation: None,
             batch_id: 0,
             was_restored: false,
         }
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        deserialize(bytes).unwrap()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8> {
+        serialize(&self).unwrap()
     }
 }
