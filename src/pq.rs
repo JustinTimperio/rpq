@@ -106,13 +106,13 @@ pub struct Item<T: Clone> {
     // User
     pub priority: u64,
     pub data: T,
-    pub disk_uuid: Option<String>,
     pub should_escalate: bool,
     pub escalation_rate: Option<Duration>,
     pub can_timeout: bool,
     pub timeout: Option<Duration>,
 
     // Internal
+    disk_uuid: Option<String>,
     submitted_at: DateTime<Utc>,
     last_escalation: Option<DateTime<Utc>>,
     batch_id: u64,
@@ -140,12 +140,31 @@ impl<T: Clone> Item<T> {
             can_timeout,
             timeout,
 
+            // Private with fn access
+            batch_id: 0,
+            was_restored: false,
+
             // Internal fields
             submitted_at: Utc::now(),
             last_escalation: None,
-            batch_id: 0,
-            was_restored: false,
         }
+    }
+
+    pub fn set_disk_uuid(&mut self) {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.disk_uuid = Some(id);
+    }
+
+    pub fn get_disk_uuid(&self) -> Option<String> {
+        self.disk_uuid.clone()
+    }
+
+    pub fn set_batch_id(&mut self, batch_id: u64) {
+        self.batch_id = batch_id;
+    }
+
+    pub fn get_batch_id(&self) -> u64 {
+        self.batch_id
     }
 
     pub fn set_restored(&mut self) {
