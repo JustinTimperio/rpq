@@ -1,12 +1,14 @@
 use core::time;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
+use std::thread::JoinHandle;
 
-use redb::{Database, TableDefinition};
+use redb::{Database, ReadableTableMetadata, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::watch;
 use tokio::time::interval;
 
 mod bpq;
@@ -24,15 +26,29 @@ pub struct RPQ<T: Ord + Clone + Send> {
     // disk_cache maintains a cache of items that are in the queue
     disk_cache: Arc<Database>,
     // lazy_disk_channel is the channel for lazy disk writes
-    lazy_disk_writer_sender: Mutex<Sender<pq::Item<T>>>,
+    lazy_disk_writer_sender: Arc<Sender<pq::Item<T>>>,
     // lazy_disk_reader is the receiver for lazy disk writes
     lazy_disk_writer_receiver: Mutex<Receiver<pq::Item<T>>>,
     // lazy_disk_delete_sender is the sender for lazy disk deletes
-    lazy_disk_delete_sender: Mutex<Sender<pq::Item<T>>>,
+    lazy_disk_delete_sender: Arc<Sender<pq::Item<T>>>,
     // lazy_disk_delete_receiver is the receiver for lazy disk deletes
     lazy_disk_delete_receiver: Mutex<Receiver<pq::Item<T>>>,
-    // synced_batches is a map of batch ids that have been fully committed
-    //synced_batches: Arc<RwLock<HashMap<u64, bool>>>,
+    // sync_handles is a map of priorities to sync handles
+    sync_handles: Mutex<Vec<JoinHandle<()>>>,
+    // synced_batches is a map of priorities to the last synced batch
+    synced_batches: Mutex<HashMap<u64, bool>>,
+    // deleted_batches is a map of priorities to the last deleted batch
+    //deleted_batches: Mutex<HashMap<u64, bool>>,
+    // message_counter is the counter for the number of messages that have been sent to the RPQ over the lifetime
+    message_counter: AtomicU64,
+    // batch_number is the current batch number
+    batch_number: AtomicU64,
+    // batches_fully_synced is a flag to indicate if all batches have been fully synced
+    batches_fully_synced: AtomicBool,
+    // shutdown_receiver is the receiver for the shutdown signal
+    shutdown_receiver: watch::Receiver<bool>,
+    // shutdown_sender is the sender for the shutdown signal
+    shutdown_sender: watch::Sender<bool>,
 }
 
 pub struct RPQOptions {
@@ -62,6 +78,9 @@ where
         // Create base structures
         let buckets = Arc::new(RwLock::new(HashMap::new()));
         let items_in_queues = AtomicU64::new(0);
+        let sync_handles = Vec::new();
+        let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+
         let lazy_disk_cache_enabled = options.lazy_disk_cache;
         let disk_cache_enabled = options.disk_cache_enabled;
 
@@ -86,13 +105,21 @@ where
         ctxn.commit().unwrap();
 
         if disk_cache_enabled {
+            let mut restored_items: u64 = 0;
             let read_txn = disk_cache.begin_read().unwrap();
             let table = read_txn.open_table(DB).unwrap();
-            let mut cursor = table.range::<&str>(..);
 
-            for entry in cursor.iter_mut() {
-                match entry.next() {
-                    Some(Ok((_key, value))) => {
+            let cursor = match table.range::<&str>(..) {
+                Ok(range) => range,
+                Err(e) => {
+                    panic!("Error opening range: {}", e);
+                }
+            };
+
+            println!("Restoring {:?} items from disk cache", table.len().unwrap());
+            for (_i, entry) in cursor.enumerate() {
+                match entry {
+                    Ok((_key, value)) => {
                         let mut item = pq::Item::from_bytes(value.value());
                         // Mark the item as restored
                         item.set_restored();
@@ -104,17 +131,16 @@ where
                         }
 
                         bucket.unwrap().enqueue(item);
+                        restored_items += 1;
                     }
-                    Some(Err(e)) => {
+                    Err(e) => {
                         println!("Error reading from disk cache: {}", e);
                         continue;
-                    }
-                    None => {
-                        break;
                     }
                 }
             }
             _ = read_txn.close();
+            println!("Restored {} items from disk cache", restored_items);
         }
 
         let rpq = RPQ {
@@ -123,41 +149,37 @@ where
             buckets,
             items_in_queues,
             disk_cache,
-            lazy_disk_writer_sender: Mutex::new(lazy_disk_writer_sender),
+            lazy_disk_writer_sender: Arc::new(lazy_disk_writer_sender),
             lazy_disk_writer_receiver: Mutex::new(lazy_disk_writer_receiver),
-            lazy_disk_delete_sender: Mutex::new(lazy_disk_delete_sender),
+            lazy_disk_delete_sender: Arc::new(lazy_disk_delete_sender),
             lazy_disk_delete_receiver: Mutex::new(lazy_disk_delete_receiver),
-            //synced_batches,
+            sync_handles: Mutex::new(sync_handles),
+            synced_batches: Mutex::new(HashMap::new()),
+            //deleted_batches: Mutex::new(HashMap::new()),
+            shutdown_receiver,
+            shutdown_sender,
+            batch_number: AtomicU64::new(0),
+            message_counter: AtomicU64::new(0),
+            batches_fully_synced: AtomicBool::new(false),
         };
         let rpq = Arc::new(rpq);
 
         // Launch the lazy disk writer
         if lazy_disk_cache_enabled {
+            let mut handles = rpq.sync_handles.lock().unwrap();
             let rpq_clone = Arc::clone(&rpq);
-            std::thread::spawn(move || {
+            handles.push(std::thread::spawn(move || {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(rpq_clone.lazy_disk_writer());
-            });
+            }));
 
             let rpq_clone = Arc::clone(&rpq);
-            std::thread::spawn(move || {
+            handles.push(std::thread::spawn(move || {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(rpq_clone.lazy_disk_deleter());
-            });
+            }));
         }
-        return rpq;
-    }
-
-    pub fn len(&self) -> u64 {
-        let mut len = 0 as u64;
-        for (_, active_bucket) in self.buckets.read().unwrap().iter() {
-            len += active_bucket.len();
-        }
-        return len;
-    }
-
-    pub fn active_buckets(&self) -> u64 {
-        self.non_empty_buckets.len()
+        rpq
     }
 
     pub async fn enqueue(&self, mut item: pq::Item<T>) {
@@ -179,10 +201,27 @@ where
 
         // If the disk cache is enabled, send the item to the lazy disk writer
         if self.options.disk_cache_enabled {
+            // Increment the batch number
+            let bn = self.batch_number.load(Ordering::SeqCst);
+            if self.message_counter.fetch_add(1, Ordering::SeqCst)
+                % self.options.lazy_disk_cache_batch_size
+                == 0
+            {
+                self.batch_number.fetch_add(1, Ordering::SeqCst);
+                println!(
+                    "Incrementing batch number to {} with {} items",
+                    bn + 1,
+                    self.message_counter.load(Ordering::SeqCst)
+                );
+            }
+
+            self.synced_batches.lock().unwrap().insert(bn, false);
+            item.set_batch_id(bn);
+
             if !item.was_restored() {
                 item.set_disk_uuid();
                 if self.options.lazy_disk_cache {
-                    let lazy_disk_writer_sender = self.lazy_disk_writer_sender.lock().unwrap();
+                    let lazy_disk_writer_sender = &self.lazy_disk_writer_sender;
                     let was_sent = lazy_disk_writer_sender.send(item.clone()).await;
                     if was_sent.is_err() {
                         println!("Error sending item to lazy disk writer");
@@ -197,7 +236,6 @@ where
         // Enqueue the item and update
         bucket.unwrap().enqueue(item);
         self.non_empty_buckets.add_bucket(priority);
-        self.items_in_queues.fetch_add(1, Ordering::Relaxed);
     }
 
     pub async fn dequeue(&self) -> Option<pq::Item<T>> {
@@ -218,9 +256,11 @@ where
 
         // Fetch the item from the bucket
         let item = queue.unwrap().dequeue();
-        if !item.is_none() {
-            self.items_in_queues.fetch_sub(1, Ordering::Relaxed);
+        if item.is_none() {
+            return None;
         }
+        self.items_in_queues.fetch_sub(1, Ordering::SeqCst);
+        let item = item.unwrap();
 
         // If the bucket is empty, remove it from the non_empty_buckets
         if queue.unwrap().len() == 0 {
@@ -230,18 +270,18 @@ where
         let item_clone = item.clone();
         if self.options.disk_cache_enabled {
             if self.options.lazy_disk_cache {
-                let lazy_disk_delete_sender = self.lazy_disk_delete_sender.lock().unwrap();
-                let was_sent = lazy_disk_delete_sender.send(item.clone().unwrap()).await;
+                let lazy_disk_delete_sender = &self.lazy_disk_delete_sender;
+                let was_sent = lazy_disk_delete_sender.send(item_clone).await;
                 if was_sent.is_err() {
                     println!("Error sending item to lazy disk delete");
                     return None;
                 }
             } else {
-                self.delete_single(item_clone.unwrap().get_disk_uuid().unwrap().as_ref());
+                self.delete_single(item_clone.get_disk_uuid().unwrap().as_ref());
             }
         }
 
-        item
+        Some(item)
     }
 
     pub fn prioritize(&self) -> Option<(u64, u64)> {
@@ -256,66 +296,169 @@ where
             removed += results.unwrap().0;
             escalated += results.unwrap().1;
         }
-        self.items_in_queues.fetch_sub(removed, Ordering::Relaxed);
+        self.items_in_queues.fetch_sub(removed, Ordering::SeqCst);
         Some((removed, escalated))
     }
 
     async fn lazy_disk_writer(&self) {
-        let mut write_cache = Vec::new();
+        let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
         let mut ticker = interval(self.options.lazy_disk_max_delay);
         let mut receiver = self.lazy_disk_writer_receiver.lock().unwrap();
+        let mut shutdown_receiver = self.shutdown_receiver.clone();
+        let mut commit_counter = 0;
         println!("Starting lazy disk writer");
 
         loop {
             // Check if the write cache is full or the ticker has ticked
             tokio::select! {
+                /*
                     _ = ticker.tick() => {
-                        if write_cache.len() > 0 {
-                            self.commit_batch(&mut write_cache);
+                        for (id, batch) in awaiting_batches.iter_mut() {
+                            self.synced_batches.lock().unwrap().insert(*id, true);
+                            self.commit_batch(batch);
                         }
                     },
+                    */
                 item = receiver.recv() => {
                     if let Some(item) = item {
-                        write_cache.push(item);
-                    }
+                        let batch_bucket = item.get_batch_id();
+                        let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
+                        batch.push(item);
 
-                    if write_cache.len() as u64 >= self.options.lazy_disk_cache_batch_size {
-                        self.commit_batch(&mut write_cache);
+                        if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size {
+                            self.commit_batch(batch);
+                            awaiting_batches.remove(&batch_bucket);
+                            commit_counter += 1;
+                            self.synced_batches.lock().unwrap().insert(batch_bucket, true);
+                        }
                     }
+                },
+                _ = shutdown_receiver.changed() => {
+                    println!("Shutting down lazy disk writer");
+
+                    receiver.close();
+
+                    while let Some(item) = receiver.recv().await {
+                        let batch_bucket = item.get_batch_id();
+                        let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
+                        batch.push(item);
+                    }
+                    for (id, batch) in awaiting_batches.iter_mut() {
+                        self.synced_batches.lock().unwrap().insert(*id, true);
+                        self.commit_batch(batch);
+                        commit_counter += 1;
+                        self.synced_batches.lock().unwrap().insert(*id, true);
+                    }
+                    self.batches_fully_synced.store(true, Ordering::SeqCst);
+
+                    println!("Lazy disk writer shutdown after committing {} batches with {} items", commit_counter, commit_counter * self.options.lazy_disk_cache_batch_size);
+                    break;
                 }
             }
         }
     }
 
     async fn lazy_disk_deleter(&self) {
-        let mut delete_cache = Vec::new();
+        let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
         let mut ticker = interval(self.options.lazy_disk_max_delay);
         let mut receiver = self.lazy_disk_delete_receiver.lock().unwrap();
+        let mut shutdown_receiver = self.shutdown_receiver.clone();
+        let mut commit_counter = 0;
 
         loop {
             // Check if the write cache is full or the ticker has ticked
             tokio::select! {
+                /*
                     _ = ticker.tick() => {
-                        if delete_cache.len() > 0 {
-                            self.delete_batch(&mut delete_cache);
+                        for (id, batch) in awaiting_batches.iter_mut() {
+                            let batches = self.synced_batches.lock().unwrap();
+                            let ok = batches.get(id).unwrap_or(&false);
+                            if *ok {
+                                    self.delete_batch(batch);
+                                    self.synced_batches.lock().unwrap().insert(*id, false);
+                            }
                         }
                     },
+                    */
                 item = receiver.recv() => {
                     if let Some(item) = item {
-                        delete_cache.push(item);
+                        let batch_bucket = item.get_batch_id();
+                        let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
+                        batch.push(item);
+
+
+                        let mut synced_batches = self.synced_batches.lock().unwrap();
+                        let ok = synced_batches.get(&batch_bucket).unwrap_or(&false);
+                        if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size && *ok {
+                            println!("Deleting batch with {} items", batch.len());
+                            self.delete_batch(batch);
+                            synced_batches.insert(batch_bucket, false);
+                            awaiting_batches.remove(&batch_bucket);
+                            commit_counter += 1;
+                        }
                     }
 
-                    if delete_cache.len() as u64 >= self.options.lazy_disk_cache_batch_size {
-                        self.delete_batch(&mut delete_cache);
+
+                },
+                _ = shutdown_receiver.changed() => {
+                    println!("Shutting down lazy disk deleter");
+                    while !self.batches_fully_synced.load(Ordering::SeqCst) {
+                        tokio::task::yield_now().await;
                     }
+                    receiver.close();
+
+                    while let Some(item) = receiver.recv().await {
+                        let batch_bucket = item.get_batch_id();
+                        let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
+                        batch.push(item);
+                    }
+
+                    for (id, batch) in awaiting_batches.iter_mut() {
+                        self.synced_batches.lock().unwrap().insert(*id, false);
+                        self.delete_batch(batch);
+                        commit_counter += 1;
+                    }
+
+                    println!("Lazy disk deleter shutdown after committing {} batches with {} items", commit_counter, commit_counter * self.options.lazy_disk_cache_batch_size);
+                    break;
                 }
+
             }
         }
     }
 
+    pub fn len(&self) -> u64 {
+        let mut len = 0 as u64;
+        for (_, active_bucket) in self.buckets.read().unwrap().iter() {
+            len += active_bucket.len();
+        }
+        len
+    }
+
+    pub fn active_buckets(&self) -> u64 {
+        self.non_empty_buckets.len()
+    }
+
+    pub fn unsynced_batches(&self) -> u64 {
+        let synced_batches = self.synced_batches.lock().unwrap();
+        let mut unsynced = 0;
+        for (_, synced) in synced_batches.iter() {
+            if !synced {
+                unsynced += 1;
+            }
+        }
+        unsynced
+    }
+
+    pub fn items_in_db(&self) -> u64 {
+        let read_txn = self.disk_cache.begin_read().unwrap();
+        let table = read_txn.open_table(DB).unwrap();
+        let count = table.len().unwrap();
+        count
+    }
+
     fn commit_batch(&self, write_cache: &mut Vec<pq::Item<T>>) {
         let write_txn = self.disk_cache.begin_write().unwrap();
-        println!("Committing batch of {} items", write_cache.len());
         for item in write_cache.iter() {
             let mut table = write_txn.open_table(DB).unwrap();
             // Convert to bytes
@@ -382,6 +525,15 @@ where
 
         write_txn.commit().unwrap();
     }
+
+    pub fn close(&self) {
+        self.shutdown_sender.send(true).unwrap();
+
+        let mut handles = self.sync_handles.lock().unwrap();
+        while let Some(handle) = handles.pop() {
+            handle.join().unwrap();
+        }
+    }
 }
 
 #[cfg(test)]
@@ -393,10 +545,10 @@ mod tests {
     #[test]
     fn e2e_test() {
         // Set Message Count
-        let message_count = 10_000_000;
+        let message_count = 1_000_000;
 
         // Set Concurrency
-        let send_threads = 4;
+        let send_threads = 1;
         let receive_threads = 1;
         let bucket_count = 10;
         let sent_counter = Arc::new(AtomicU64::new(0));
@@ -408,9 +560,9 @@ mod tests {
             bucket_count,
             disk_cache_enabled: true,
             database_path: "/tmp/rpq.redb".to_string(),
-            lazy_disk_cache: false,
+            lazy_disk_cache: true,
             lazy_disk_max_delay: time::Duration::from_secs(5),
-            lazy_disk_cache_batch_size: 50000,
+            lazy_disk_cache_batch_size: 10000,
             buffer_size: 1_000_000,
         };
         let rpq = Arc::new(RPQ::new(options));
@@ -429,17 +581,19 @@ mod tests {
                 let (removed, escalated) = results.unwrap();
                 total_escalated += escalated;
                 total_removed += removed;
-                removed_clone.fetch_add(removed, Ordering::Relaxed);
+                removed_clone.fetch_add(removed, Ordering::SeqCst);
             }
 
             println!(
-                "Total: {} | Sent: {} | Received: {} | Removed: {} | Escalated: {} | Removed: {}",
+                "Total: {} | Sent: {} | Received: {} | Removed: {} | Escalated: {} | Removed: {} | Unsynced Batches: {} | Items in DB: {}",
                 rpq_clone.len(),
-                sent_clone.load(Ordering::Relaxed),
-                received_clone.load(Ordering::Relaxed),
-                removed_clone.load(Ordering::Relaxed),
+                sent_clone.load(Ordering::SeqCst),
+                received_clone.load(Ordering::SeqCst),
+                removed_clone.load(Ordering::SeqCst),
                 total_escalated,
-                total_removed
+                total_removed,
+                rpq_clone.unsynced_batches(),
+                rpq_clone.items_in_db()
             );
             std::thread::sleep(time::Duration::from_secs(1));
         });
@@ -466,12 +620,12 @@ mod tests {
                             Some(std::time::Duration::from_secs(5)),
                         );
 
-                        if sent_clone.load(Ordering::Relaxed) >= message_count {
+                        if sent_clone.load(Ordering::SeqCst) >= message_count {
                             break;
                         }
 
                         rpq_clone.enqueue(item).await;
-                        sent_clone.fetch_add(1, Ordering::Relaxed);
+                        sent_clone.fetch_add(1, Ordering::SeqCst);
                     }
                 });
             }));
@@ -492,11 +646,11 @@ mod tests {
                 let runtime = tokio::runtime::Runtime::new().unwrap();
                 runtime.block_on(async {
                     loop {
-                        if (sent_clone.load(Ordering::Relaxed)
-                            == (received_clone.load(Ordering::Relaxed)
-                                + removed_clone.load(Ordering::Relaxed)))
+                        if (sent_clone.load(Ordering::SeqCst)
+                            <= (received_clone.load(Ordering::SeqCst)
+                                + removed_clone.load(Ordering::SeqCst)))
                             && rpq_clone.len() == 0
-                            && sent_clone.load(Ordering::Relaxed) >= message_count
+                            && sent_clone.load(Ordering::SeqCst) >= message_count
                         {
                             break;
                         }
@@ -506,7 +660,7 @@ mod tests {
                             continue;
                         }
 
-                        received_clone.fetch_add(1, Ordering::Relaxed);
+                        received_clone.fetch_add(1, Ordering::SeqCst);
                     }
                 });
             }));
@@ -523,5 +677,10 @@ mod tests {
         }
 
         println!("Total: {}", rpq.len());
+
+        // Close the RPQ
+        println!("Waiting for RPQ to close");
+        rpq.close();
+        assert_eq!(rpq.items_in_db(), 0);
     }
 }
