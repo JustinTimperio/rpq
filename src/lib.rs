@@ -86,7 +86,7 @@ impl<T: Ord + Clone + Send + Sync> RPQ<T>
 where
     T: Serialize + DeserializeOwned + 'static,
 {
-    pub fn new(options: RPQOptions) -> Arc<RPQ<T>> {
+    pub async fn new(options: RPQOptions) -> Arc<RPQ<T>> {
         // Create base structures
         let buckets = Arc::new(RwLock::new(HashMap::new()));
         let items_in_queues = AtomicU64::new(0);
@@ -98,68 +98,29 @@ where
             deleted_batches: HashMap::new(),
         };
 
-        let lazy_disk_cache_enabled = options.lazy_disk_cache;
-        let disk_cache_enabled = options.disk_cache_enabled;
-
         // Create the lazy disk sync channel
         let (lazy_disk_writer_sender, lazy_disk_writer_receiver) =
             channel(options.buffer_size as usize);
         let (lazy_disk_delete_sender, lazy_disk_delete_receiver) =
             channel(options.buffer_size as usize);
 
-        // Create the disk cache
+        // Capture some variables
         let path = options.database_path.clone();
+        let lazy_disk_cache_enabled = options.lazy_disk_cache;
+        let disk_cache_enabled = options.disk_cache_enabled;
 
         // Create the buckets
         for i in 0..options.bucket_count {
             buckets.write().unwrap().insert(i, pq::PriorityQueue::new());
         }
 
-        // If the disk cache is enabled, load the items from the disk cache
+        // Create the disk cache and create the table
         let disk_cache = Arc::new(Database::create(path).unwrap());
         let ctxn = disk_cache.begin_write().unwrap();
         ctxn.open_table(DB).unwrap();
         ctxn.commit().unwrap();
 
-        if disk_cache_enabled {
-            let mut restored_items: u64 = 0;
-            let read_txn = disk_cache.begin_read().unwrap();
-            let table = read_txn.open_table(DB).unwrap();
-
-            let cursor = match table.range::<&str>(..) {
-                Ok(range) => range,
-                Err(e) => {
-                    panic!("Error opening range: {}", e);
-                }
-            };
-
-            println!("Restoring {:?} items from disk cache", table.len().unwrap());
-            for (_i, entry) in cursor.enumerate() {
-                match entry {
-                    Ok((_key, value)) => {
-                        let mut item = pq::Item::from_bytes(value.value());
-                        // Mark the item as restored
-                        item.set_restored();
-
-                        let buckets = buckets.write().unwrap();
-                        let bucket = buckets.get(&item.priority);
-                        if bucket.is_none() {
-                            continue;
-                        }
-
-                        bucket.unwrap().enqueue(item);
-                        restored_items += 1;
-                    }
-                    Err(e) => {
-                        println!("Error reading from disk cache: {}", e);
-                        continue;
-                    }
-                }
-            }
-            _ = read_txn.close();
-            println!("Restored {} items from disk cache", restored_items);
-        }
-
+        // Create the RPQ
         let rpq = RPQ {
             options,
             non_empty_buckets: bpq::BucketPriorityQueue::new(),
@@ -181,6 +142,41 @@ where
             batch_shutdown_receiver: batch_shutdown_receiver,
         };
         let rpq = Arc::new(rpq);
+
+        // Restore the items from the disk cache
+        if disk_cache_enabled {
+            let mut restored_items: u64 = 0;
+            let read_txn = rpq.disk_cache.begin_read().unwrap();
+            let table = read_txn.open_table(DB).unwrap();
+
+            let cursor = match table.range::<&str>(..) {
+                Ok(range) => range,
+                Err(e) => {
+                    panic!("Error opening range: {}", e);
+                }
+            };
+
+            println!("Restoring {:?} items from disk cache", table.len().unwrap());
+            for (_i, entry) in cursor.enumerate() {
+                match entry {
+                    Ok((_key, value)) => {
+                        let mut item = pq::Item::from_bytes(value.value());
+                        // Mark the item as restored
+                        item.set_restored();
+                        rpq.enqueue(item).await;
+                        restored_items += 1;
+                    }
+                    Err(e) => {
+                        println!("Error reading from disk cache: {}", e);
+                        continue;
+                    }
+                }
+            }
+            _ = read_txn.close();
+            println!("Restored {} items from disk cache", restored_items);
+        }
+
+        //std::thread::sleep(time::Duration::from_secs(100));
 
         // Launch the lazy disk writer
         if lazy_disk_cache_enabled {
@@ -313,7 +309,7 @@ where
 
     async fn lazy_disk_writer(&self) {
         let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
-        let mut ticker = interval(self.options.lazy_disk_max_delay);
+        // let mut ticker = interval(self.options.lazy_disk_max_delay);
         let mut receiver = self.lazy_disk_writer_receiver.lock().unwrap();
         let mut shutdown_receiver = self.shutdown_receiver.clone();
         let mut commit_counter = 0;
@@ -337,11 +333,9 @@ where
                         batch.push(item);
 
                         if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size {
-
                             let mut shandler = self.batch_handler.lock().unwrap();
 
                             if *shandler.deleted_batches.get(&batch_bucket).unwrap_or(&false) {
-                                println!("Batch was deleted, skipping");
                                 batch.clear();
                                 awaiting_batches.remove(&batch_bucket);
                             } else {
@@ -389,7 +383,8 @@ where
 
     async fn lazy_disk_deleter(&self) {
         let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
-        let mut ticker = interval(self.options.lazy_disk_max_delay);
+        let mut restored_items: Vec<pq::Item<T>> = Vec::new();
+        //let mut ticker = interval(self.options.lazy_disk_max_delay);
         let mut receiver = self.lazy_disk_delete_receiver.lock().unwrap();
         let mut shutdown_receiver = self.batch_shutdown_receiver.clone();
         let mut commit_counter = 0;
@@ -411,6 +406,17 @@ where
                     */
                 item = receiver.recv() => {
                     if let Some(item) = item {
+
+                        if item.was_restored() {
+                            restored_items.push(item);
+
+                            if restored_items.len() as u64 >= self.options.lazy_disk_cache_batch_size {
+                                self.delete_batch(&mut restored_items);
+                                restored_items.clear();
+                            }
+                            continue;
+                        }
+
                         let batch_bucket = item.get_batch_id();
                         let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
                         batch.push(item);
@@ -440,10 +446,19 @@ where
                     receiver.close();
 
                     while let Some(item) = receiver.recv().await {
+
+                        if item.was_restored() {
+                            restored_items.push(item);
+                            continue;
+                        }
+
                         let batch_bucket = item.get_batch_id();
                         let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
                         batch.push(item);
                     }
+
+                    // Commit the remaining batches
+                    self.delete_batch(&mut restored_items);
 
                     for (id, batch) in awaiting_batches.iter_mut() {
                         let batch_handler = self.batch_handler.lock().unwrap();
@@ -608,7 +623,11 @@ mod tests {
             lazy_disk_cache_batch_size: 10000,
             buffer_size: 1_000_000,
         };
-        let rpq = Arc::new(RPQ::new(options));
+        let rpq = Arc::new(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(RPQ::new(options)),
+        );
 
         // Launch the monitoring thread
         let rpq_clone = Arc::clone(&rpq);

@@ -27,7 +27,6 @@ impl<T: Ord + Clone> PriorityQueue<T> {
         // Set the internal fields
         item.submitted_at = Utc::now();
         item.last_escalation = None;
-        item.was_restored = false;
 
         // Add the item to the queue
         self.items.write().unwrap().push_back(item);
