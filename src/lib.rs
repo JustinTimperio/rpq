@@ -21,6 +21,7 @@ pub struct RPQ<T: Ord + Clone + Send> {
     non_empty_buckets: bpq::BucketPriorityQueue,
     // buckets is a map of priorities to a binary heap of items
     buckets: Arc<RwLock<HashMap<u64, pq::PriorityQueue<T>>>>,
+
     // items_in_queues is the number of items across all queues
     items_in_queues: AtomicU64,
     // disk_cache maintains a cache of items that are in the queue
@@ -33,22 +34,33 @@ pub struct RPQ<T: Ord + Clone + Send> {
     lazy_disk_delete_sender: Arc<Sender<pq::Item<T>>>,
     // lazy_disk_delete_receiver is the receiver for lazy disk deletes
     lazy_disk_delete_receiver: Mutex<Receiver<pq::Item<T>>>,
-    // sync_handles is a map of priorities to sync handles
-    sync_handles: Mutex<Vec<JoinHandle<()>>>,
-    // synced_batches is a map of priorities to the last synced batch
-    synced_batches: Mutex<HashMap<u64, bool>>,
-    // deleted_batches is a map of priorities to the last deleted batch
-    //deleted_batches: Mutex<HashMap<u64, bool>>,
+
     // message_counter is the counter for the number of messages that have been sent to the RPQ over the lifetime
     message_counter: AtomicU64,
     // batch_number is the current batch number
     batch_number: AtomicU64,
     // batches_fully_synced is a flag to indicate if all batches have been fully synced
     batches_fully_synced: AtomicBool,
+    // batch_handler is the handler for batches
+    batch_handler: Mutex<BatchHandler>,
+    // batch_shutdown_receiver is the receiver for the shutdown signal
+    batch_shutdown_receiver: watch::Receiver<bool>,
+    // batch_shutdown_sender is the sender for the shutdown signal
+    batch_shutdown_sender: watch::Sender<bool>,
+
     // shutdown_receiver is the receiver for the shutdown signal
     shutdown_receiver: watch::Receiver<bool>,
     // shutdown_sender is the sender for the shutdown signal
     shutdown_sender: watch::Sender<bool>,
+    // sync_handles is a map of priorities to sync handles
+    sync_handles: Mutex<Vec<JoinHandle<()>>>,
+}
+
+struct BatchHandler {
+    // synced_batches is a map of priorities to the last synced batch
+    synced_batches: HashMap<u64, bool>,
+    // deleted_batches is a map of priorities to the last deleted batch
+    deleted_batches: HashMap<u64, bool>,
 }
 
 pub struct RPQOptions {
@@ -80,6 +92,11 @@ where
         let items_in_queues = AtomicU64::new(0);
         let sync_handles = Vec::new();
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
+        let (batch_shutdown_sender, batch_shutdown_receiver) = watch::channel(false);
+        let batch_handler = BatchHandler {
+            synced_batches: HashMap::new(),
+            deleted_batches: HashMap::new(),
+        };
 
         let lazy_disk_cache_enabled = options.lazy_disk_cache;
         let disk_cache_enabled = options.disk_cache_enabled;
@@ -154,13 +171,14 @@ where
             lazy_disk_delete_sender: Arc::new(lazy_disk_delete_sender),
             lazy_disk_delete_receiver: Mutex::new(lazy_disk_delete_receiver),
             sync_handles: Mutex::new(sync_handles),
-            synced_batches: Mutex::new(HashMap::new()),
-            //deleted_batches: Mutex::new(HashMap::new()),
             shutdown_receiver,
             shutdown_sender,
             batch_number: AtomicU64::new(0),
             message_counter: AtomicU64::new(0),
             batches_fully_synced: AtomicBool::new(false),
+            batch_handler: Mutex::new(batch_handler),
+            batch_shutdown_sender: batch_shutdown_sender,
+            batch_shutdown_receiver: batch_shutdown_receiver,
         };
         let rpq = Arc::new(rpq);
 
@@ -208,14 +226,7 @@ where
                 == 0
             {
                 self.batch_number.fetch_add(1, Ordering::SeqCst);
-                println!(
-                    "Incrementing batch number to {} with {} items",
-                    bn + 1,
-                    self.message_counter.load(Ordering::SeqCst)
-                );
             }
-
-            self.synced_batches.lock().unwrap().insert(bn, false);
             item.set_batch_id(bn);
 
             if !item.was_restored() {
@@ -326,29 +337,47 @@ where
                         batch.push(item);
 
                         if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size {
-                            self.commit_batch(batch);
-                            awaiting_batches.remove(&batch_bucket);
-                            commit_counter += 1;
-                            self.synced_batches.lock().unwrap().insert(batch_bucket, true);
+
+                            let mut shandler = self.batch_handler.lock().unwrap();
+
+                            if *shandler.deleted_batches.get(&batch_bucket).unwrap_or(&false) {
+                                println!("Batch was deleted, skipping");
+                                batch.clear();
+                                awaiting_batches.remove(&batch_bucket);
+                            } else {
+                                self.commit_batch(batch);
+                                awaiting_batches.remove(&batch_bucket);
+                                commit_counter += 1;
+                                shandler.synced_batches.insert(batch_bucket, true);
+                            }
                         }
                     }
                 },
                 _ = shutdown_receiver.changed() => {
                     println!("Shutting down lazy disk writer");
-
                     receiver.close();
 
+                    // Pull the remaining items from the receiver
                     while let Some(item) = receiver.recv().await {
                         let batch_bucket = item.get_batch_id();
                         let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
                         batch.push(item);
                     }
+
+                    // Commit the remaining batches
                     for (id, batch) in awaiting_batches.iter_mut() {
-                        self.synced_batches.lock().unwrap().insert(*id, true);
+                        let mut batch_handler = self.batch_handler.lock().unwrap();
+
+                        if *batch_handler.deleted_batches.get(id).unwrap_or(&false) {
+                            batch.clear();
+                            continue;
+                        }
+
+                        batch_handler.synced_batches.insert(*id, true);
                         self.commit_batch(batch);
                         commit_counter += 1;
-                        self.synced_batches.lock().unwrap().insert(*id, true);
                     }
+                    self.batch_shutdown_sender.send(true).unwrap();
                     self.batches_fully_synced.store(true, Ordering::SeqCst);
 
                     println!("Lazy disk writer shutdown after committing {} batches with {} items", commit_counter, commit_counter * self.options.lazy_disk_cache_batch_size);
@@ -362,7 +391,7 @@ where
         let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
         let mut ticker = interval(self.options.lazy_disk_max_delay);
         let mut receiver = self.lazy_disk_delete_receiver.lock().unwrap();
-        let mut shutdown_receiver = self.shutdown_receiver.clone();
+        let mut shutdown_receiver = self.batch_shutdown_receiver.clone();
         let mut commit_counter = 0;
 
         loop {
@@ -386,19 +415,22 @@ where
                         let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
                         batch.push(item);
 
+                        if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size{
 
-                        let mut synced_batches = self.synced_batches.lock().unwrap();
-                        let ok = synced_batches.get(&batch_bucket).unwrap_or(&false);
-                        if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size && *ok {
-                            println!("Deleting batch with {} items", batch.len());
-                            self.delete_batch(batch);
-                            synced_batches.insert(batch_bucket, false);
-                            awaiting_batches.remove(&batch_bucket);
-                            commit_counter += 1;
+                            let mut batch_handler = self.batch_handler.lock().unwrap();
+                            batch_handler.deleted_batches.insert(batch_bucket, true);
+
+                            let was_synced = batch_handler.synced_batches.get(&batch_bucket).unwrap_or(&false);
+                            if *was_synced {
+                                self.delete_batch(batch);
+                                awaiting_batches.remove(&batch_bucket);
+                                commit_counter += 1;
+                            } else {
+                                batch.clear();
+                                awaiting_batches.remove(&batch_bucket);
+                            }
                         }
                     }
-
-
                 },
                 _ = shutdown_receiver.changed() => {
                     println!("Shutting down lazy disk deleter");
@@ -414,9 +446,15 @@ where
                     }
 
                     for (id, batch) in awaiting_batches.iter_mut() {
-                        self.synced_batches.lock().unwrap().insert(*id, false);
-                        self.delete_batch(batch);
-                        commit_counter += 1;
+                        let batch_handler = self.batch_handler.lock().unwrap();
+                        let was_synced = batch_handler.synced_batches.get(id).unwrap_or(&false);
+
+                        if *was_synced {
+                            self.delete_batch(batch);
+                            commit_counter += 1;
+                        } else {
+                            batch.clear();
+                        }
                     }
 
                     println!("Lazy disk deleter shutdown after committing {} batches with {} items", commit_counter, commit_counter * self.options.lazy_disk_cache_batch_size);
@@ -440,14 +478,19 @@ where
     }
 
     pub fn unsynced_batches(&self) -> u64 {
-        let synced_batches = self.synced_batches.lock().unwrap();
-        let mut unsynced = 0;
-        for (_, synced) in synced_batches.iter() {
-            if !synced {
-                unsynced += 1;
+        let mut unsynced_batches = 0;
+        let batch_handler = self.batch_handler.lock().unwrap();
+        for (_, synced) in batch_handler.synced_batches.iter() {
+            if !*synced {
+                unsynced_batches += 1;
             }
         }
-        unsynced
+        for (_, deleted) in batch_handler.deleted_batches.iter() {
+            if !*deleted {
+                unsynced_batches += 1;
+            }
+        }
+        unsynced_batches
     }
 
     pub fn items_in_db(&self) -> u64 {
