@@ -123,7 +123,6 @@ impl<T: Clone> Item<T> {
     pub fn new(
         priority: u64,
         data: T,
-        disk_uuid: Option<String>,
         should_escalate: bool,
         escalation_rate: Option<Duration>,
         can_timeout: bool,
@@ -133,7 +132,6 @@ impl<T: Clone> Item<T> {
             // User-provided fields
             priority,
             data,
-            disk_uuid,
             should_escalate,
             escalation_rate,
             can_timeout,
@@ -142,6 +140,7 @@ impl<T: Clone> Item<T> {
             // Private with fn access
             batch_id: 0,
             was_restored: false,
+            disk_uuid: None,
 
             // Internal fields
             submitted_at: Utc::now(),

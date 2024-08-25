@@ -186,22 +186,21 @@ where
             }
             _ = read_txn.close();
             println!("Restored {} items from disk cache", restored_items);
-        }
 
-        // Launch the lazy disk writer
-        if lazy_disk_cache_enabled {
-            let mut handles = rpq.sync_handles.lock().unwrap();
-            let rpq_clone = Arc::clone(&rpq);
-            handles.push(std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime.block_on(rpq_clone.lazy_disk_writer());
-            }));
+            if lazy_disk_cache_enabled {
+                let mut handles = rpq.sync_handles.lock().unwrap();
+                let rpq_clone = Arc::clone(&rpq);
+                handles.push(std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    runtime.block_on(rpq_clone.lazy_disk_writer());
+                }));
 
-            let rpq_clone = Arc::clone(&rpq);
-            handles.push(std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime.block_on(rpq_clone.lazy_disk_deleter());
-            }));
+                let rpq_clone = Arc::clone(&rpq);
+                handles.push(std::thread::spawn(move || {
+                    let runtime = tokio::runtime::Runtime::new().unwrap();
+                    runtime.block_on(rpq_clone.lazy_disk_deleter());
+                }));
+            }
         }
         return (rpq, restored_items);
     }
@@ -284,8 +283,8 @@ where
             self.non_empty_buckets.remove_bucket(&bucket_id);
         }
 
-        let item_clone = item.clone();
         if self.options.disk_cache_enabled {
+            let item_clone = item.clone();
             if self.options.lazy_disk_cache {
                 let lazy_disk_delete_sender = &self.lazy_disk_delete_sender;
                 let was_sent = lazy_disk_delete_sender.send(item_clone).await;
@@ -340,6 +339,7 @@ where
                         batch_handler.deleted_batches.insert(*id, false);
                     }
                 },
+
                 // Add the item to the cache if it is received
                 item = receiver.recv() => {
                     if let Some(item) = item {
@@ -363,6 +363,7 @@ where
                         }
                     }
                 },
+
                 // Shutdown the writer if the shutdown signal is received
                 _ = shutdown_receiver.changed() => {
                     receiver.close();
@@ -578,6 +579,9 @@ where
     }
 
     pub fn items_in_db(&self) -> u64 {
+        if self.disk_cache.is_none() {
+            return 0;
+        }
         let read_txn = self.disk_cache.as_ref().unwrap().begin_read().unwrap();
         let table = read_txn.open_table(DB).unwrap();
         let count = table.len().unwrap();
@@ -598,15 +602,17 @@ where
 mod tests {
     use super::*;
     use core::time;
-    use std::sync::atomic::AtomicBool;
+    use std::{collections::VecDeque, sync::atomic::AtomicBool};
 
     #[test]
     fn order_test() {
+        let message_count = 10_000_000;
+
         let options = RPQOptions {
             bucket_count: 10,
             disk_cache_enabled: false,
             database_path: "/tmp/rpq.redb".to_string(),
-            lazy_disk_cache: true,
+            lazy_disk_cache: false,
             lazy_disk_max_delay: time::Duration::from_secs(5),
             lazy_disk_cache_batch_size: 5000,
             buffer_size: 1_000_000,
@@ -620,26 +626,30 @@ mod tests {
 
         let rpq = Arc::clone(&r.0);
         let runtime = tokio::runtime::Runtime::new().unwrap();
+        let mut expected_data = HashMap::new();
 
-        for i in 0..10 {
+        for i in 0..message_count {
             runtime.block_on(async {
                 let item = pq::Item::new(
+                    i % 10,
                     i,
-                    i,
-                    None,
                     false,
                     None,
                     false,
                     Some(std::time::Duration::from_secs(5)),
                 );
                 rpq.enqueue(item).await;
+                let v = expected_data.entry(i % 10).or_insert(VecDeque::new());
+                v.push_back(i);
             });
         }
 
-        for i in 0..10 {
+        for _i in 0..message_count {
             runtime.block_on(async {
-                let item = rpq.dequeue().await;
-                assert!(item.unwrap().priority == i);
+                let item = rpq.dequeue().await.unwrap();
+                let v = expected_data.get_mut(&item.priority).unwrap();
+                let expected_data = v.pop_front().unwrap();
+                assert!(item.data == expected_data);
             });
         }
     }
@@ -667,7 +677,7 @@ mod tests {
             lazy_disk_cache: true,
             lazy_disk_max_delay: time::Duration::from_secs(5),
             lazy_disk_cache_batch_size: 5000,
-            buffer_size: 1_000_000,
+            buffer_size: 500_000,
         };
         let r = Arc::new(
             tokio::runtime::Runtime::new()
@@ -683,19 +693,22 @@ mod tests {
         let removed_clone = Arc::clone(&removed_counter);
         let escalated_clone = Arc::clone(&total_escalated);
         std::thread::spawn(move || loop {
+            std::thread::sleep(time::Duration::from_secs(10));
+
             let results = rpq_clone.prioritize();
             if !results.is_none() {
                 let (removed, escalated) = results.unwrap();
                 removed_clone.fetch_add(removed, Ordering::SeqCst);
                 escalated_clone.fetch_add(escalated, Ordering::SeqCst);
             }
-
-            std::thread::sleep(time::Duration::from_secs(5));
         });
+
+        let total_timer = std::time::Instant::now();
 
         // Enqueue items
         println!("Launching {} Send Threads", send_threads);
         let mut send_handles = Vec::new();
+        let send_timer = std::time::Instant::now();
         for _ in 0..send_threads {
             let rpq_clone = Arc::clone(&rpq);
             let sent_clone = Arc::clone(&sent_counter);
@@ -709,7 +722,6 @@ mod tests {
                             //rand::thread_rng().gen_range(0..bucket_count),
                             sent_clone.load(Ordering::SeqCst) % bucket_count,
                             0,
-                            None,
                             false,
                             None,
                             false,
@@ -730,6 +742,7 @@ mod tests {
         // Dequeue items
         println!("Launching {} Receive Threads", receive_threads);
         let mut receive_handles = Vec::new();
+        let receive_timer = std::time::Instant::now();
         for _ in 0..receive_threads {
             // Clone all the shared variables
             let rpq_clone = Arc::clone(&rpq);
@@ -767,12 +780,14 @@ mod tests {
         for handle in send_handles {
             handle.join().unwrap();
         }
-        finshed_sending.store(true, Ordering::SeqCst);
+        let send_time = send_timer.elapsed().as_secs_f64();
 
+        finshed_sending.store(true, Ordering::SeqCst);
         // Wait for receive threads to finish
         for handle in receive_handles {
             handle.join().unwrap();
         }
+        let receive_time = receive_timer.elapsed().as_secs_f64();
 
         // Close the RPQ
         println!("Waiting for RPQ to close");
@@ -784,6 +799,12 @@ mod tests {
             received_counter.load(Ordering::SeqCst),
             removed_counter.load(Ordering::SeqCst),
             total_escalated.load(Ordering::SeqCst)
+        );
+        println!(
+            "Send Time: {}s, Receive Time: {}s, Total Time: {}s",
+            send_time,
+            receive_time,
+            total_timer.elapsed().as_secs_f64()
         );
 
         assert_eq!(rpq.items_in_db(), 0);
