@@ -6,11 +6,11 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
-pub struct PriorityQueue<T: Ord + Clone> {
+pub struct PriorityQueue<T: Ord + Clone + Send> {
     items: RwLock<VecDeque<Item<T>>>,
 }
 
-impl<T: Ord + Clone> PriorityQueue<T> {
+impl<T: Ord + Clone + Send> PriorityQueue<T> {
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
             items: RwLock::new(VecDeque::new()),
@@ -101,7 +101,7 @@ impl<T: Ord + Clone> PriorityQueue<T> {
 
 // Item is a struct that holds the data and metadata for an item in the queue
 #[derive(Serialize, Deserialize, Clone)]
-pub struct Item<T: Clone> {
+pub struct Item<T: Clone + Send> {
     // User
     pub priority: u64,
     pub data: T,
@@ -118,7 +118,7 @@ pub struct Item<T: Clone> {
     was_restored: bool,
 }
 
-impl<T: Clone> Item<T> {
+impl<T: Clone + Send> Item<T> {
     // Constructor to initialize the struct
     pub fn new(
         priority: u64,

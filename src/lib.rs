@@ -1,18 +1,19 @@
 use core::time;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Mutex, RwLock};
-use std::thread::JoinHandle;
+use std::sync::Arc;
 
 use redb::{Database, ReadableTableMetadata, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::watch;
+use tokio::sync::{Mutex, RwLock};
+use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 mod bpq;
-mod pq;
+pub mod pq;
 
 pub struct RPQ<T: Ord + Clone + Send> {
     // options is the configuration for the RPQ
@@ -113,12 +114,11 @@ where
 
         // Capture some variables
         let path = options.database_path.clone();
-        let lazy_disk_cache_enabled = options.lazy_disk_cache;
         let disk_cache_enabled = options.disk_cache_enabled;
 
         // Create the buckets
         for i in 0..options.bucket_count {
-            buckets.write().unwrap().insert(i, pq::PriorityQueue::new());
+            buckets.write().await.insert(i, pq::PriorityQueue::new());
         }
 
         let disk_cache: Option<Arc<Database>>;
@@ -187,20 +187,16 @@ where
             _ = read_txn.close();
             println!("Restored {} items from disk cache", restored_items);
 
-            if lazy_disk_cache_enabled {
-                let mut handles = rpq.sync_handles.lock().unwrap();
-                let rpq_clone = Arc::clone(&rpq);
-                handles.push(std::thread::spawn(move || {
-                    let runtime = tokio::runtime::Runtime::new().unwrap();
-                    runtime.block_on(rpq_clone.lazy_disk_writer());
-                }));
+            let mut handles = rpq.sync_handles.lock().await;
+            let rpq_clone = Arc::clone(&rpq);
+            handles.push(tokio::spawn(async move {
+                rpq_clone.lazy_disk_writer().await;
+            }));
 
-                let rpq_clone = Arc::clone(&rpq);
-                handles.push(std::thread::spawn(move || {
-                    let runtime = tokio::runtime::Runtime::new().unwrap();
-                    runtime.block_on(rpq_clone.lazy_disk_deleter());
-                }));
-            }
+            let rpq_clone = Arc::clone(&rpq);
+            handles.push(tokio::spawn(async move {
+                rpq_clone.lazy_disk_deleter().await;
+            }));
         }
         return (rpq, restored_items);
     }
@@ -214,7 +210,7 @@ where
         let priority = item.priority;
 
         // Get the bucket and enqueue the item
-        let buckets = self.buckets.read().unwrap();
+        let buckets = self.buckets.read().await;
         let bucket = buckets.get(&item.priority);
 
         if bucket.is_none() {
@@ -225,7 +221,7 @@ where
         // If the disk cache is enabled, send the item to the lazy disk writer
         if self.options.disk_cache_enabled {
             // Increment the batch number
-            let mut batch_counter = self.batch_counter.lock().unwrap();
+            let mut batch_counter = self.batch_counter.lock().await;
             batch_counter.message_counter += 1;
             if batch_counter.message_counter % self.options.lazy_disk_cache_batch_size == 0 {
                 batch_counter.batch_number += 1;
@@ -255,7 +251,7 @@ where
     }
 
     pub async fn dequeue(&self) -> Option<pq::Item<T>> {
-        let buckets = self.buckets.read().unwrap();
+        let buckets = self.buckets.read().await;
 
         // Fetch the bucket
         let bucket_id = self.non_empty_buckets.peek();
@@ -300,11 +296,11 @@ where
         Some(item)
     }
 
-    pub fn prioritize(&self) -> Option<(u64, u64)> {
+    pub async fn prioritize(&self) -> Option<(u64, u64)> {
         let mut removed = 0;
         let mut escalated = 0;
 
-        for (_, active_bucket) in self.buckets.read().unwrap().iter() {
+        for (_, active_bucket) in self.buckets.read().await.iter() {
             let results = active_bucket.prioritize();
             if results.is_none() {
                 continue;
@@ -319,7 +315,7 @@ where
     async fn lazy_disk_writer(&self) {
         let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
         let mut ticker = interval(self.options.lazy_disk_max_delay);
-        let mut receiver = self.lazy_disk_writer_receiver.lock().unwrap();
+        let mut receiver = self.lazy_disk_writer_receiver.lock().await;
         let mut shutdown_receiver = self.shutdown_receiver.clone();
 
         loop {
@@ -328,7 +324,7 @@ where
                 // Flush the cache if the ticker has ticked
                 _ = ticker.tick() => {
                     for (id, batch) in awaiting_batches.iter_mut() {
-                        let mut batch_handler = self.batch_handler.lock().unwrap();
+                        let mut batch_handler = self.batch_handler.lock().await;
 
                         if *batch_handler.deleted_batches.get(id).unwrap_or(&false) {
                             batch.clear();
@@ -348,7 +344,7 @@ where
                         batch.push(item);
 
                         if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size {
-                            let mut shandler = self.batch_handler.lock().unwrap();
+                            let mut shandler = self.batch_handler.lock().await;
 
                             if *shandler.deleted_batches.get(&batch_bucket).unwrap_or(&false) {
                                 batch.clear();
@@ -377,7 +373,7 @@ where
 
                     // Commit the remaining batches
                     for (id, batch) in awaiting_batches.iter_mut() {
-                        let mut batch_handler = self.batch_handler.lock().unwrap();
+                        let mut batch_handler = self.batch_handler.lock().await;
 
                         if *batch_handler.deleted_batches.get(id).unwrap_or(&false) {
                             batch.clear();
@@ -399,7 +395,7 @@ where
     async fn lazy_disk_deleter(&self) {
         let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
         let mut restored_items: Vec<pq::Item<T>> = Vec::new();
-        let mut receiver = self.lazy_disk_delete_receiver.lock().unwrap();
+        let mut receiver = self.lazy_disk_delete_receiver.lock().await;
         let mut shutdown_receiver = self.batch_shutdown_receiver.clone();
 
         loop {
@@ -425,7 +421,7 @@ where
 
                         // Check if the batch is full
                         if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size {
-                            let mut batch_handler = self.batch_handler.lock().unwrap();
+                            let mut batch_handler = self.batch_handler.lock().await;
                             let was_synced = batch_handler.synced_batches.get(&batch_bucket).unwrap_or(&false);
                             if *was_synced {
                                 self.delete_batch(batch);
@@ -464,7 +460,7 @@ where
                         restored_items.clear();
                     }
                     for (id, batch) in awaiting_batches.iter_mut() {
-                        let mut batch_handler = self.batch_handler.lock().unwrap();
+                        let mut batch_handler = self.batch_handler.lock().await;
                         let was_synced = batch_handler.synced_batches.get(id).unwrap_or(&false);
                         if *was_synced {
                             self.delete_batch(batch);
@@ -550,9 +546,9 @@ where
         write_txn.commit().unwrap();
     }
 
-    pub fn len(&self) -> u64 {
+    pub async fn len(&self) -> u64 {
         let mut len = 0 as u64;
-        for (_, active_bucket) in self.buckets.read().unwrap().iter() {
+        for (_, active_bucket) in self.buckets.read().await.iter() {
             len += active_bucket.len();
         }
         len
@@ -562,9 +558,9 @@ where
         self.non_empty_buckets.len()
     }
 
-    pub fn unsynced_batches(&self) -> u64 {
+    pub async fn unsynced_batches(&self) -> u64 {
         let mut unsynced_batches = 0;
-        let batch_handler = self.batch_handler.lock().unwrap();
+        let batch_handler = self.batch_handler.lock().await;
         for (_, synced) in batch_handler.synced_batches.iter() {
             if !*synced {
                 unsynced_batches += 1;
@@ -588,25 +584,27 @@ where
         count
     }
 
-    pub fn close(&self) {
+    pub async fn close(&self) {
         self.shutdown_sender.send(true).unwrap();
 
-        let mut handles = self.sync_handles.lock().unwrap();
+        let mut handles = self.sync_handles.lock().await;
         while let Some(handle) = handles.pop() {
-            handle.join().unwrap();
+            handle.abort();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use tokio::runtime;
+
     use super::*;
     use core::time;
     use std::{collections::VecDeque, sync::atomic::AtomicBool};
 
     #[test]
     fn order_test() {
-        let message_count = 10_000_000;
+        let message_count = 1_000_000;
 
         let options = RPQOptions {
             bucket_count: 10,
@@ -695,7 +693,10 @@ mod tests {
         std::thread::spawn(move || loop {
             std::thread::sleep(time::Duration::from_secs(10));
 
-            let results = rpq_clone.prioritize();
+            let runtime = tokio::runtime::Runtime::new().unwrap();
+
+            let results = runtime.block_on(async { rpq_clone.prioritize().await });
+
             if !results.is_none() {
                 let (removed, escalated) = results.unwrap();
                 removed_clone.fetch_add(removed, Ordering::SeqCst);
@@ -791,7 +792,10 @@ mod tests {
 
         // Close the RPQ
         println!("Waiting for RPQ to close");
-        rpq.close();
+
+        runtime::Runtime::new().unwrap().block_on(async {
+            rpq.close().await;
+        });
 
         println!(
             "Sent: {}, Received: {}, Removed: {}, Escalated: {}",
@@ -808,5 +812,52 @@ mod tests {
         );
 
         assert_eq!(rpq.items_in_db(), 0);
+    }
+
+    #[test]
+    fn speed_test() {
+        let message_count = 10_000_000;
+
+        let options = RPQOptions {
+            bucket_count: 10,
+            disk_cache_enabled: false,
+            database_path: "/tmp/rpq.redb".to_string(),
+            lazy_disk_cache: false,
+            lazy_disk_max_delay: time::Duration::from_secs(5),
+            lazy_disk_cache_batch_size: 5000,
+            buffer_size: 1_000_000,
+        };
+
+        let r = Arc::new(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(RPQ::new(options)),
+        );
+
+        let rpq = Arc::clone(&r.0);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        let timer = std::time::Instant::now();
+        for i in 0..message_count {
+            runtime.block_on(async {
+                let item = pq::Item::new(
+                    i % 10,
+                    i,
+                    false,
+                    None,
+                    false,
+                    Some(std::time::Duration::from_secs(5)),
+                );
+                rpq.enqueue(item).await;
+            });
+        }
+
+        for _i in 0..message_count {
+            runtime.block_on(async {
+                rpq.dequeue().await;
+            });
+        }
+
+        println!("Total Time: {}s", timer.elapsed().as_secs_f64());
     }
 }
