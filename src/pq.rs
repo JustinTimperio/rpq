@@ -1,11 +1,16 @@
-use std::time::{Duration, Instant};
+use std::time::Duration;
 use std::{collections::VecDeque, sync::RwLock};
 
-pub struct PriorityQueue<T: Ord> {
+use bincode::{deserialize, serialize};
+use chrono::{DateTime, Utc};
+use serde::de::DeserializeOwned;
+use serde::{Deserialize, Serialize};
+
+pub struct PriorityQueue<T: Ord + Clone> {
     items: RwLock<VecDeque<Item<T>>>,
 }
 
-impl<T: Ord> PriorityQueue<T> {
+impl<T: Ord + Clone> PriorityQueue<T> {
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
             items: RwLock::new(VecDeque::new()),
@@ -20,9 +25,8 @@ impl<T: Ord> PriorityQueue<T> {
         let mut item = item;
 
         // Set the internal fields
-        item.submitted_at = Instant::now();
+        item.submitted_at = Utc::now();
         item.last_escalation = None;
-        item.was_restored = false;
 
         // Add the item to the queue
         self.items.write().unwrap().push_back(item);
@@ -40,7 +44,10 @@ impl<T: Ord> PriorityQueue<T> {
         for (index, item) in items.iter_mut().enumerate() {
             // Timeout items that have been in the queue for too long
             if item.can_timeout {
-                if item.timeout.unwrap().as_secs() < item.submitted_at.elapsed().as_secs() {
+                if item.timeout.unwrap().as_millis()
+                    >= (Utc::now().timestamp_millis() - item.submitted_at.timestamp_millis())
+                        as u128
+                {
                     to_remove.push(index);
                     continue;
                 }
@@ -50,10 +57,11 @@ impl<T: Ord> PriorityQueue<T> {
             if item.should_escalate {
                 // Check if we have ever escalated this item
                 if item.last_escalation.is_none() {
-                    if item.escalation_rate.unwrap().as_secs()
-                        > item.submitted_at.elapsed().as_secs()
+                    if item.escalation_rate.unwrap().as_millis()
+                        > (Utc::now().timestamp_millis() - item.submitted_at.timestamp_millis())
+                            as u128
                     {
-                        item.last_escalation = Some(Instant::now());
+                        item.last_escalation = Some(Utc::now());
                         if index > 0 {
                             to_swap.push(index);
                         }
@@ -62,10 +70,12 @@ impl<T: Ord> PriorityQueue<T> {
                 }
 
                 // Check if we need to escalate this item again
-                if item.escalation_rate.unwrap().as_secs()
-                    > item.last_escalation.unwrap().elapsed().as_secs()
+                if item.escalation_rate.unwrap().as_millis()
+                    >= (Utc::now().timestamp_millis()
+                        - item.last_escalation.unwrap().timestamp_millis())
+                        as u128
                 {
-                    item.last_escalation = Some(Instant::now());
+                    item.last_escalation = Some(Utc::now());
                     if index > 0 {
                         to_swap.push(index);
                     }
@@ -90,24 +100,25 @@ impl<T: Ord> PriorityQueue<T> {
 }
 
 // Item is a struct that holds the data and metadata for an item in the queue
-pub struct Item<T> {
+#[derive(Serialize, Deserialize, Clone)]
+pub struct Item<T: Clone> {
     // User
     pub priority: u64,
     pub data: T,
-    pub disk_uuid: Option<String>,
     pub should_escalate: bool,
     pub escalation_rate: Option<Duration>,
     pub can_timeout: bool,
     pub timeout: Option<Duration>,
 
     // Internal
-    submitted_at: Instant,
-    last_escalation: Option<Instant>,
+    disk_uuid: Option<String>,
+    submitted_at: DateTime<Utc>,
+    last_escalation: Option<DateTime<Utc>>,
     batch_id: u64,
     was_restored: bool,
 }
 
-impl<T> Item<T> {
+impl<T: Clone> Item<T> {
     // Constructor to initialize the struct
     pub fn new(
         priority: u64,
@@ -128,11 +139,52 @@ impl<T> Item<T> {
             can_timeout,
             timeout,
 
-            // Internal fields
-            submitted_at: Instant::now(),
-            last_escalation: None,
+            // Private with fn access
             batch_id: 0,
             was_restored: false,
+
+            // Internal fields
+            submitted_at: Utc::now(),
+            last_escalation: None,
         }
+    }
+
+    pub fn set_disk_uuid(&mut self) {
+        let id = uuid::Uuid::new_v4().to_string();
+        self.disk_uuid = Some(id);
+    }
+
+    pub fn get_disk_uuid(&self) -> Option<String> {
+        self.disk_uuid.clone()
+    }
+
+    pub fn set_batch_id(&mut self, batch_id: u64) {
+        self.batch_id = batch_id;
+    }
+
+    pub fn get_batch_id(&self) -> u64 {
+        self.batch_id
+    }
+
+    pub fn set_restored(&mut self) {
+        self.was_restored = true;
+    }
+
+    pub fn was_restored(&self) -> bool {
+        self.was_restored
+    }
+
+    pub fn from_bytes(bytes: &[u8]) -> Self
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        deserialize(bytes).unwrap()
+    }
+
+    pub fn to_bytes(&self) -> Vec<u8>
+    where
+        T: Serialize + DeserializeOwned,
+    {
+        serialize(&self).unwrap()
     }
 }
