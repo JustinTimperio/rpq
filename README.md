@@ -3,7 +3,7 @@
 </p>
 
 <h4 align="center">
-  RPQ is a my first Rust project is very experimental at this stage. It will be sometime before this project is in a stable place. 
+  RPQ is a concurrency safe, embeddable priority queue that can be used in a variety of applications. This project is still in the early stages of development and is my first major Rust project so this lib is currently NOT reccomended for production use.
 </h4>
 
 
@@ -40,7 +40,12 @@ RPQ is a concurrency safe, embeddable priority queue that can be used in a varie
 - [pq-bench (Priority Queue Benchmarks)](https://github.com/JustinTimperio/pq-bench)
 
 ## Benchmarks
-TODO
+Due to the fact that most operations are done in constant time O(1) or logarithmic time O(log n), with the exception of the prioritize function which happens in linear time O(n), all RPQ operations are extremely fast. A single RPQ can handle a few million transactions a second and can be tuned depending on your work load. I have included some basic benchmarks using C++, Rust, Zig, and Go to measure RPQ's performance against the standard implementations of other languages that can be found here at: [pq-bench](https://github.com/JustinTimperio/pq-bench). 
+
+|                                                                                                             |                                                                                       |
+|-------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
+| ![Time-Spent](https://github.com/JustinTimperio/pq-bench/blob/master/docs/Time-Spent-vs-Implementation.png) | ![Queue-Speed-WITHOUT-Reprioritize](./docs/soon.png)                                  |
+| ![TODO: Queue-Speed-WITH-Reprioritize](./docs/soon.png)                                                     | ![Reprioritize-All-Buckets-Every-100-Milliseconds-VS-No-Reprioritze](./docs/soon.png) |
 
 ## Usage
 TODO
@@ -49,7 +54,38 @@ TODO
 TODO
 
 #### Example Usage
-TODO
+```rust
+let runtime = tokio::runtime::Runtime::new().unwrap();
+
+// Create a new RPQ with the following options
+let options = RPQOptions {
+    bucket_count: 10,
+    disk_cache_enabled: false,
+    database_path: "/tmp/rpq.redb".to_string(),
+    lazy_disk_cache: false,
+    lazy_disk_max_delay: std::time::Duration::from_secs(5),
+    lazy_disk_cache_batch_size: 5000,
+    buffer_size: 1_000_000,
+};
+let rpq = Arc::new(runtime.block_on(RPQ::new(options)));
+
+// Create a new item and enqueue it
+let item = Item::new(
+    0,
+    "test".to_string(),
+    false,
+    None,
+    false,
+    Some(std::time::Duration::from_secs(5)),
+);
+rqp.enqueue(item).await;
+
+// Dequeue the item
+result = rqp.dequeue().await;
+```
+
+
+
 
 
 ## Contributing
