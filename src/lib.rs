@@ -25,7 +25,7 @@ pub struct RPQ<T: Ord + Clone + Send> {
     // items_in_queues is the number of items across all queues
     items_in_queues: AtomicU64,
     // disk_cache maintains a cache of items that are in the queue
-    disk_cache: Arc<Database>,
+    disk_cache: Option<Arc<Database>>,
     // lazy_disk_channel is the channel for lazy disk writes
     lazy_disk_writer_sender: Arc<Sender<pq::Item<T>>>,
     // lazy_disk_reader is the receiver for lazy disk writes
@@ -121,11 +121,14 @@ where
             buckets.write().unwrap().insert(i, pq::PriorityQueue::new());
         }
 
-        // Create the disk cache and create the table
-        let disk_cache = Arc::new(Database::create(path).unwrap());
-        let ctxn = disk_cache.begin_write().unwrap();
-        ctxn.open_table(DB).unwrap();
-        ctxn.commit().unwrap();
+        let disk_cache: Option<Arc<Database>>;
+        if disk_cache_enabled {
+            let db = Database::create(&path).unwrap();
+            let db = Arc::new(db);
+            disk_cache = Some(db);
+        } else {
+            disk_cache = None;
+        }
 
         // Create the RPQ
         let rpq = RPQ {
@@ -151,7 +154,12 @@ where
         // Restore the items from the disk cache
         let mut restored_items: u64 = 0;
         if disk_cache_enabled {
-            let read_txn = rpq.disk_cache.begin_read().unwrap();
+            // Create a the initial table
+            let ctxn = rpq.disk_cache.as_ref().unwrap().begin_write().unwrap();
+            ctxn.open_table(DB).unwrap();
+            ctxn.commit().unwrap();
+
+            let read_txn = rpq.disk_cache.as_ref().unwrap().begin_read().unwrap();
             let table = read_txn.open_table(DB).unwrap();
 
             let cursor = match table.range::<&str>(..) {
@@ -473,7 +481,7 @@ where
     }
 
     fn commit_batch(&self, write_cache: &mut Vec<pq::Item<T>>) {
-        let write_txn = self.disk_cache.begin_write().unwrap();
+        let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         for item in write_cache.iter() {
             let mut table = write_txn.open_table(DB).unwrap();
             // Convert to bytes
@@ -492,7 +500,7 @@ where
     }
 
     fn delete_batch(&self, delete_cache: &mut Vec<pq::Item<T>>) {
-        let write_txn = self.disk_cache.begin_write().unwrap();
+        let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         for item in delete_cache.iter() {
             let mut table = write_txn.open_table(DB).unwrap();
             // Convert to bytes
@@ -510,7 +518,7 @@ where
     }
 
     fn commit_single(&self, item: pq::Item<T>) {
-        let write_txn = self.disk_cache.begin_write().unwrap();
+        let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         {
             let mut table = write_txn.open_table(DB).unwrap();
             // Convert to bytes
@@ -528,7 +536,7 @@ where
     }
 
     fn delete_single(&self, key: &str) {
-        let write_txn = self.disk_cache.begin_write().unwrap();
+        let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         {
             let mut table = write_txn.open_table(DB).unwrap();
             let was_written = table.remove(key);
@@ -570,7 +578,7 @@ where
     }
 
     pub fn items_in_db(&self) -> u64 {
-        let read_txn = self.disk_cache.begin_read().unwrap();
+        let read_txn = self.disk_cache.as_ref().unwrap().begin_read().unwrap();
         let table = read_txn.open_table(DB).unwrap();
         let count = table.len().unwrap();
         count
@@ -593,13 +601,57 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     #[test]
+    fn order_test() {
+        let options = RPQOptions {
+            bucket_count: 10,
+            disk_cache_enabled: false,
+            database_path: "/tmp/rpq.redb".to_string(),
+            lazy_disk_cache: true,
+            lazy_disk_max_delay: time::Duration::from_secs(5),
+            lazy_disk_cache_batch_size: 5000,
+            buffer_size: 1_000_000,
+        };
+
+        let r = Arc::new(
+            tokio::runtime::Runtime::new()
+                .unwrap()
+                .block_on(RPQ::new(options)),
+        );
+
+        let rpq = Arc::clone(&r.0);
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+
+        for i in 0..10 {
+            runtime.block_on(async {
+                let item = pq::Item::new(
+                    i,
+                    i,
+                    None,
+                    false,
+                    None,
+                    false,
+                    Some(std::time::Duration::from_secs(5)),
+                );
+                rpq.enqueue(item).await;
+            });
+        }
+
+        for i in 0..10 {
+            runtime.block_on(async {
+                let item = rpq.dequeue().await;
+                assert!(item.unwrap().priority == i);
+            });
+        }
+    }
+
+    #[test]
     fn e2e_test() {
         // Set Message Count
-        let message_count = 1_000_000;
+        let message_count = 500_000;
 
         // Set Concurrency
-        let send_threads = 1;
-        let receive_threads = 1;
+        let send_threads = 4;
+        let receive_threads = 4;
         let bucket_count = 10;
         let sent_counter = Arc::new(AtomicU64::new(0));
         let received_counter = Arc::new(AtomicU64::new(0));
