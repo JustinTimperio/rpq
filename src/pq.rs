@@ -6,14 +6,18 @@ use chrono::{DateTime, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 
+mod ftime;
+
 pub struct PriorityQueue<T: Ord + Clone + Send> {
     items: RwLock<VecDeque<Item<T>>>,
+    ftime: ftime::CachedTime,
 }
 
 impl<T: Ord + Clone + Send> PriorityQueue<T> {
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
             items: RwLock::new(VecDeque::new()),
+            ftime: ftime::CachedTime::new(Duration::from_millis(250)),
         }
     }
 
@@ -25,7 +29,7 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         let mut item = item;
 
         // Set the internal fields
-        item.submitted_at = Utc::now();
+        item.submitted_at = self.ftime.get_time().into();
         item.last_escalation = None;
 
         // Add the item to the queue
@@ -45,7 +49,8 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
             // Timeout items that have been in the queue for too long
             if item.can_timeout {
                 if item.timeout.unwrap().as_millis()
-                    >= (Utc::now().timestamp_millis() - item.submitted_at.timestamp_millis())
+                    >= (self.ftime.get_time().timestamp_millis()
+                        - item.submitted_at.unwrap().timestamp_millis())
                         as u128
                 {
                     to_remove.push(index);
@@ -58,7 +63,8 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
                 // Check if we have ever escalated this item
                 if item.last_escalation.is_none() {
                     if item.escalation_rate.unwrap().as_millis()
-                        > (Utc::now().timestamp_millis() - item.submitted_at.timestamp_millis())
+                        > (self.ftime.get_time().timestamp_millis()
+                            - item.submitted_at.unwrap().timestamp_millis())
                             as u128
                     {
                         item.last_escalation = Some(Utc::now());
@@ -112,7 +118,7 @@ pub struct Item<T: Clone + Send> {
 
     // Internal
     disk_uuid: Option<String>,
-    submitted_at: DateTime<Utc>,
+    submitted_at: Option<DateTime<Utc>>,
     last_escalation: Option<DateTime<Utc>>,
     batch_id: u64,
     was_restored: bool,
@@ -143,7 +149,7 @@ impl<T: Clone + Send> Item<T> {
             disk_uuid: None,
 
             // Internal fields
-            submitted_at: Utc::now(),
+            submitted_at: None,
             last_escalation: None,
         }
     }
