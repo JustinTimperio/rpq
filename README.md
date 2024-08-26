@@ -3,7 +3,7 @@
 </p>
 
 <h4 align="center">
-  RPQ is a concurrency safe, embeddable priority queue that can be used in a variety of applications. This project is still in the early stages of development and is my first major Rust project so this lib is currently NOT reccomended for production use.
+  RPQ is a concurrency safe, embeddable priority queue that can be used in a variety of applications. This project is still in the early stages of development and is my first major Rust project so this lib is currently NOT production ready.
 </h4>
 
 
@@ -42,21 +42,35 @@ RPQ is a concurrency safe, embeddable priority queue that can be used in a varie
 ## Benchmarks
 Due to the fact that most operations are done in constant time O(1) or logarithmic time O(log n), with the exception of the prioritize function which happens in linear time O(n), all RPQ operations are extremely fast. A single RPQ can handle a few million transactions a second and can be tuned depending on your work load. I have included some basic benchmarks using C++, Rust, Zig, and Go to measure RPQ's performance against the standard implementations of other languages that can be found here at: [pq-bench](https://github.com/JustinTimperio/pq-bench). 
 
-|                                                                                                             |                                                                                       |
-|-------------------------------------------------------------------------------------------------------------|---------------------------------------------------------------------------------------|
-| ![Time-Spent](https://github.com/JustinTimperio/pq-bench/blob/master/docs/Time-Spent-vs-Implementation.png) | ![Queue-Speed-WITHOUT-Reprioritize](./docs/soon.png)                                  |
-| ![TODO: Queue-Speed-WITH-Reprioritize](./docs/soon.png)                                                     | ![Reprioritize-All-Buckets-Every-100-Milliseconds-VS-No-Reprioritze](./docs/soon.png) |
+|                                                                                                             |                                                                                                 |
+|-------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------|
+| ![Time-Spent](https://github.com/JustinTimperio/pq-bench/blob/master/docs/Time-Spent-vs-Implementation.png) | ![Queue-Speed-WITHOUT-Reprioritize](./docs/Queue-Speed-Without-Prioritize.png)                  |
+| ![TODO: Queue-Speed-WITH-Reprioritize](./docs/Queue-Speed-With-Prioritize.png)                              | ![Time-to-Send-and-Recive-VS-Bucket-Count](./docs/Time-to-Send-and-Receive-VS-Bucket-Count.png) |
 
 ## Usage
-TODO
+RPQ is a embeddable priority queue that is meant to be used at the core of critical workloads where complex ordering are required in combination with large volumes of data. The best way to us RPQ is to import the Crate and use the API to interact with the queue.
+
+TODO: Publish to crates.io
+
+```toml
+[dependencies]
+rpq = "0.1.0"
+```
 
 ### API Reference
-TODO
+- `RPQ::new(options: RPQOptions) -> (RPQ, u64)` - Creates a new RPQ with the given options and returns the number of restored items.
+  - `enqueue(mut item: Item)` - Enqueues a new item into the RPQ.
+  - `dequeue() -> Option<Item>` - Dequeues the next item from the RPQ.
+  - `prioritize()` - Reprioritizes all items in the RPQ.
+  - `len() -> u64` - Returns the number of items in the RPQ.
+  - `active_buckets() -> u64` - Returns the number of active buckets in the RPQ.
+  - `unsynced_batches() -> u64` - Returns the number of unsynced batches pending to be commit to disk.
+  - `items_in_db() -> u64` - Returns the number of items in the RPQ database.
+  - `close()` - Closes the RPQ and saves the state to disk if needed.
+
 
 #### Example Usage
 ```rust
-let runtime = tokio::runtime::Runtime::new().unwrap();
-
 // Create a new RPQ with the following options
 let options = RPQOptions {
     bucket_count: 10,
@@ -67,7 +81,7 @@ let options = RPQOptions {
     lazy_disk_cache_batch_size: 5000,
     buffer_size: 1_000_000,
 };
-let rpq = Arc::new(runtime.block_on(RPQ::new(options)));
+let rpq = Arc::new(RPQ::new(options).await);
 
 // Create a new item and enqueue it
 let item = Item::new(
@@ -81,12 +95,8 @@ let item = Item::new(
 rqp.enqueue(item).await;
 
 // Dequeue the item
-result = rqp.dequeue().await;
+let result = rqp.dequeue().await;
 ```
-
-
-
-
 
 ## Contributing
 RPQ is actively looking for maintainers so feel free to help out when:

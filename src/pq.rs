@@ -17,7 +17,7 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
             items: RwLock::new(VecDeque::new()),
-            ftime: ftime::CachedTime::new(Duration::from_millis(250)),
+            ftime: ftime::CachedTime::new(Duration::from_millis(50)),
         }
     }
 
@@ -48,44 +48,47 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         for (index, item) in items.iter_mut().enumerate() {
             // Timeout items that have been in the queue for too long
             if item.can_timeout {
-                if item.timeout.unwrap().as_millis()
-                    >= (self.ftime.get_time().timestamp_millis()
-                        - item.submitted_at.unwrap().timestamp_millis())
-                        as u128
-                {
-                    to_remove.push(index);
-                    continue;
+                if let (Some(timeout), Some(submitted_at)) = (item.timeout, item.submitted_at) {
+                    let current_time_millis = self.ftime.get_time().timestamp_millis() as u128;
+                    let submitted_time_millis = submitted_at.timestamp_millis() as u128;
+                    let elapsed_time = current_time_millis - submitted_time_millis;
+
+                    if elapsed_time >= timeout.as_millis() {
+                        to_remove.push(index);
+                        continue;
+                    }
                 }
             }
 
             // Escalate items that have been in the queue for too long
             if item.should_escalate {
+                let current_time_millis = self.ftime.get_time().timestamp_millis() as u128;
+                let submitted_time_millis = item.submitted_at.unwrap().timestamp_millis() as u128;
+                let escalation_rate_millis = item.escalation_rate.unwrap().as_millis();
+
                 // Check if we have ever escalated this item
                 if item.last_escalation.is_none() {
-                    if item.escalation_rate.unwrap().as_millis()
-                        > (self.ftime.get_time().timestamp_millis()
-                            - item.submitted_at.unwrap().timestamp_millis())
-                            as u128
-                    {
-                        item.last_escalation = Some(Utc::now());
+                    let elapsed_time = current_time_millis - submitted_time_millis;
+
+                    if elapsed_time > escalation_rate_millis {
+                        item.last_escalation = Some(self.ftime.get_time());
                         if index > 0 {
                             to_swap.push(index);
                         }
                     }
-                    continue;
-                }
+                } else {
+                    let last_escalation_time_millis =
+                        item.last_escalation.unwrap().timestamp_millis() as u128;
+                    let time_since_last_escalation =
+                        current_time_millis - last_escalation_time_millis;
 
-                // Check if we need to escalate this item again
-                if item.escalation_rate.unwrap().as_millis()
-                    >= (Utc::now().timestamp_millis()
-                        - item.last_escalation.unwrap().timestamp_millis())
-                        as u128
-                {
-                    item.last_escalation = Some(Utc::now());
-                    if index > 0 {
-                        to_swap.push(index);
+                    // Check if we need to escalate this item again
+                    if time_since_last_escalation >= escalation_rate_millis {
+                        item.last_escalation = Some(self.ftime.get_time());
+                        if index > 0 {
+                            to_swap.push(index);
+                        }
                     }
-                    continue;
                 }
             }
         }
