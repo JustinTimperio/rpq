@@ -589,21 +589,19 @@ where
 
         let mut handles = self.sync_handles.lock().await;
         while let Some(handle) = handles.pop() {
-            handle.abort();
+            handle.await.unwrap();
         }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    use tokio::runtime;
-
     use super::*;
     use core::time;
     use std::{collections::VecDeque, sync::atomic::AtomicBool};
 
-    #[test]
-    fn order_test() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn order_test() {
         let message_count = 1_000_000;
 
         let options = RPQOptions {
@@ -616,44 +614,34 @@ mod tests {
             buffer_size: 1_000_000,
         };
 
-        let r = Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(RPQ::new(options)),
-        );
-
+        let r = Arc::new(RPQ::new(options).await);
         let rpq = Arc::clone(&r.0);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-        let mut expected_data = HashMap::new();
 
+        let mut expected_data = HashMap::new();
         for i in 0..message_count {
-            runtime.block_on(async {
-                let item = pq::Item::new(
-                    i % 10,
-                    i,
-                    false,
-                    None,
-                    false,
-                    Some(std::time::Duration::from_secs(5)),
-                );
-                rpq.enqueue(item).await;
-                let v = expected_data.entry(i % 10).or_insert(VecDeque::new());
-                v.push_back(i);
-            });
+            let item = pq::Item::new(
+                i % 10,
+                i,
+                false,
+                None,
+                false,
+                Some(std::time::Duration::from_secs(5)),
+            );
+            rpq.enqueue(item).await;
+            let v = expected_data.entry(i % 10).or_insert(VecDeque::new());
+            v.push_back(i);
         }
 
         for _i in 0..message_count {
-            runtime.block_on(async {
-                let item = rpq.dequeue().await.unwrap();
-                let v = expected_data.get_mut(&item.priority).unwrap();
-                let expected_data = v.pop_front().unwrap();
-                assert!(item.data == expected_data);
-            });
+            let item = rpq.dequeue().await.unwrap();
+            let v = expected_data.get_mut(&item.priority).unwrap();
+            let expected_data = v.pop_front().unwrap();
+            assert!(item.data == expected_data);
         }
     }
 
-    #[test]
-    fn e2e_test() {
+    #[tokio::test(flavor = "multi_thread")]
+    async fn e2e_test() {
         // Set Message Count
         let message_count = 500_000;
 
@@ -677,30 +665,33 @@ mod tests {
             lazy_disk_cache_batch_size: 5000,
             buffer_size: 500_000,
         };
-        let r = Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(RPQ::new(options)),
-        );
+        let r = Arc::new(RPQ::new(options).await);
 
         let rpq = Arc::clone(&r.0);
         let restored_items = r.1;
 
         // Launch the monitoring thread
         let rpq_clone = Arc::clone(&rpq);
+        let (shutdown_sender, mut shutdown_receiver) = watch::channel(false);
         let removed_clone = Arc::clone(&removed_counter);
         let escalated_clone = Arc::clone(&total_escalated);
-        std::thread::spawn(move || loop {
-            std::thread::sleep(time::Duration::from_secs(10));
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_receiver.changed() => {
+                    return;
+                },
+                _ = async {
+                    loop {
+                        tokio::time::sleep(time::Duration::from_secs(10)).await;
+                        let results = rpq_clone.prioritize().await;
 
-            let runtime = tokio::runtime::Runtime::new().unwrap();
-
-            let results = runtime.block_on(async { rpq_clone.prioritize().await });
-
-            if !results.is_none() {
-                let (removed, escalated) = results.unwrap();
-                removed_clone.fetch_add(removed, Ordering::SeqCst);
-                escalated_clone.fetch_add(escalated, Ordering::SeqCst);
+                        if !results.is_none() {
+                            let (removed, escalated) = results.unwrap();
+                            removed_clone.fetch_add(removed, Ordering::SeqCst);
+                            escalated_clone.fetch_add(escalated, Ordering::SeqCst);
+                        }
+                    }
+                } => {}
             }
         });
 
@@ -714,29 +705,26 @@ mod tests {
             let rpq_clone = Arc::clone(&rpq);
             let sent_clone = Arc::clone(&sent_counter);
 
-            send_handles.push(std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-
-                runtime.block_on(async {
-                    loop {
-                        let item = pq::Item::new(
-                            //rand::thread_rng().gen_range(0..bucket_count),
-                            sent_clone.load(Ordering::SeqCst) % bucket_count,
-                            0,
-                            false,
-                            None,
-                            false,
-                            Some(std::time::Duration::from_secs(5)),
-                        );
-
-                        if sent_clone.load(Ordering::SeqCst) >= message_count {
-                            break;
-                        }
-
-                        rpq_clone.enqueue(item).await;
-                        sent_clone.fetch_add(1, Ordering::SeqCst);
+            send_handles.push(tokio::spawn(async move {
+                loop {
+                    if sent_clone.load(Ordering::SeqCst) >= message_count {
+                        break;
                     }
-                });
+
+                    let item = pq::Item::new(
+                        //rand::thread_rng().gen_range(0..bucket_count),
+                        sent_clone.load(Ordering::SeqCst) % bucket_count,
+                        0,
+                        false,
+                        None,
+                        false,
+                        Some(std::time::Duration::from_secs(5)),
+                    );
+
+                    rpq_clone.enqueue(item).await;
+                    sent_clone.fetch_add(1, Ordering::SeqCst);
+                }
+                println!("Finished Sending");
             }));
         }
 
@@ -753,49 +741,44 @@ mod tests {
             let finshed_sending_clone = Arc::clone(&finshed_sending);
 
             // Spawn the thread
-            receive_handles.push(std::thread::spawn(move || {
-                let runtime = tokio::runtime::Runtime::new().unwrap();
-                runtime.block_on(async {
-                    loop {
-                        if finshed_sending_clone.load(Ordering::SeqCst) {
-                            if received_clone.load(Ordering::SeqCst)
-                                + removed_clone.load(Ordering::SeqCst)
-                                == sent_clone.load(Ordering::SeqCst) + restored_items
-                            {
-                                break;
-                            }
+            receive_handles.push(tokio::spawn(async move {
+                loop {
+                    if finshed_sending_clone.load(Ordering::SeqCst) {
+                        if received_clone.load(Ordering::SeqCst)
+                            + removed_clone.load(Ordering::SeqCst)
+                            >= sent_clone.load(Ordering::SeqCst) + restored_items
+                        {
+                            break;
                         }
-
-                        let item = rpq_clone.dequeue().await;
-                        if item.is_none() {
-                            continue;
-                        }
-
-                        received_clone.fetch_add(1, Ordering::SeqCst);
                     }
-                });
+
+                    let item = rpq_clone.dequeue().await;
+                    if item.is_none() {
+                        continue;
+                    }
+
+                    received_clone.fetch_add(1, Ordering::SeqCst);
+                }
             }));
         }
 
         // Wait for send threads to finish
         for handle in send_handles {
-            handle.join().unwrap();
+            handle.await.unwrap();
         }
         let send_time = send_timer.elapsed().as_secs_f64();
 
         finshed_sending.store(true, Ordering::SeqCst);
         // Wait for receive threads to finish
         for handle in receive_handles {
-            handle.join().unwrap();
+            handle.await.unwrap();
         }
         let receive_time = receive_timer.elapsed().as_secs_f64();
+        shutdown_sender.send(true).unwrap();
 
         // Close the RPQ
         println!("Waiting for RPQ to close");
-
-        runtime::Runtime::new().unwrap().block_on(async {
-            rpq.close().await;
-        });
+        rpq.close().await;
 
         println!(
             "Sent: {}, Received: {}, Removed: {}, Escalated: {}",
@@ -812,52 +795,5 @@ mod tests {
         );
 
         assert_eq!(rpq.items_in_db(), 0);
-    }
-
-    #[test]
-    fn speed_test() {
-        let message_count = 10_000_000;
-
-        let options = RPQOptions {
-            bucket_count: 10,
-            disk_cache_enabled: false,
-            database_path: "/tmp/rpq.redb".to_string(),
-            lazy_disk_cache: false,
-            lazy_disk_max_delay: time::Duration::from_secs(5),
-            lazy_disk_cache_batch_size: 5000,
-            buffer_size: 1_000_000,
-        };
-
-        let r = Arc::new(
-            tokio::runtime::Runtime::new()
-                .unwrap()
-                .block_on(RPQ::new(options)),
-        );
-
-        let rpq = Arc::clone(&r.0);
-        let runtime = tokio::runtime::Runtime::new().unwrap();
-
-        let timer = std::time::Instant::now();
-        for i in 0..message_count {
-            runtime.block_on(async {
-                let item = pq::Item::new(
-                    i % 10,
-                    i,
-                    false,
-                    None,
-                    false,
-                    Some(std::time::Duration::from_secs(5)),
-                );
-                rpq.enqueue(item).await;
-            });
-        }
-
-        for _i in 0..message_count {
-            runtime.block_on(async {
-                rpq.dequeue().await;
-            });
-        }
-
-        println!("Total Time: {}s", timer.elapsed().as_secs_f64());
     }
 }
