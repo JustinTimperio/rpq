@@ -727,8 +727,10 @@ mod tests {
         };
 
         let r: Result<(Arc<RPQ<usize>>, usize), Box<dyn Error>> = RPQ::new(options).await;
-        let r = r.unwrap();
-        let rpq = Arc::clone(&r.0);
+        if r.is_err() {
+            panic!("Error creating RPQ");
+        }
+        let (rpq, _restored_items) = r.unwrap();
 
         let mut expected_data = HashMap::new();
         for i in 0..message_count {
@@ -790,9 +792,7 @@ mod tests {
         if r.is_err() {
             panic!("Error creating RPQ");
         }
-        let r = r.unwrap();
-        let rpq = Arc::clone(&r.0);
-        let restored_items = r.1;
+        let (rpq, restored_items) = r.unwrap();
 
         // Launch the monitoring thread
         let rpq_clone = Arc::clone(&rpq);

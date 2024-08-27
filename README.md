@@ -58,20 +58,20 @@ rpq = "0.1.0"
 ```
 
 ### API Reference
-- `RPQ::new(options: RPQOptions) -> (RPQ, u64)` - Creates a new RPQ with the given options and returns the number of restored items.
+- `RPQ::new(options: RPQOptions) -> (RPQ, usize)` - Creates a new RPQ with the given options and returns the number of restored items.
   - `enqueue(mut item: Item)` - Enqueues a new item into the RPQ.
   - `dequeue() -> Option<Item>` - Dequeues the next item from the RPQ.
   - `prioritize()` - Reprioritizes all items in the RPQ.
-  - `len() -> u64` - Returns the number of items in the RPQ.
-  - `active_buckets() -> u64` - Returns the number of active buckets in the RPQ.
-  - `unsynced_batches() -> u64` - Returns the number of unsynced batches pending to be commit to disk.
-  - `items_in_db() -> u64` - Returns the number of items in the RPQ database.
+  - `len() -> usize` - Returns the number of items in the RPQ.
+  - `active_buckets() -> usize` - Returns the number of active buckets in the RPQ.
+  - `unsynced_batches() -> usize` - Returns the number of unsynced batches pending to be commit to disk.
+  - `items_in_db() -> usize` - Returns the number of items in the RPQ database.
   - `close()` - Closes the RPQ and saves the state to disk if needed.
 
 
 #### Example Usage
 ```rust
-// Create a new RPQ with the following options
+// Set the options for the RPQ
 let options = RPQOptions {
     bucket_count: 10,
     disk_cache_enabled: false,
@@ -81,21 +81,35 @@ let options = RPQOptions {
     lazy_disk_cache_batch_size: 5000,
     buffer_size: 1_000_000,
 };
-let rpq = Arc::new(RPQ::new(options).await);
 
-// Create a new item and enqueue it
+// Create a new RPQ
+let result = RPQ::new(options).await;
+if result.is_err() {
+  // Handle error
+}
+let (rpq, restored_items) = result.unwrap();
+
+// Create a new item
 let item = Item::new(
     0,
     "test".to_string(),
     false,
     None,
     false,
-    Some(std::time::Duration::from_secs(5)),
+    None,
 );
-rqp.enqueue(item).await;
+
+// Enqueue the item
+let enqueue_result = rqp.enqueue(item).await;
+if enqueue_result.is_err() {
+  // Handle error
+}
 
 // Dequeue the item
 let result = rqp.dequeue().await;
+if result.is_err() {
+  // Handle error
+}
 ```
 
 ## Contributing
