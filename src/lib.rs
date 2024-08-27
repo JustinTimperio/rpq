@@ -8,12 +8,59 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::mpsc::{channel, Receiver, Sender};
 use tokio::sync::watch;
-use tokio::sync::{Mutex, RwLock};
+use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 mod bpq;
 pub mod pq;
+
+/*
+
+Archtecture Notes:
+
+In many ways, RPQ slighty compromises the performance of a traditional priority queue in order to provide
+a variety of features that are useful when absorbing distributed load from many down or upstream services.
+It employs a fairly novel techinique that allows us to lazily write and delete items from a disk cache while
+still maintaining data in memory. This basically means that a object can be added to the queue and then removed
+without the disk commit ever blocking the processes sending or reciving the data. In the case that a batch of data
+has already been removed from the queue before it is written to disk, the data is simply discarded. This
+dramaically reduces the amount of time spent doing disk commits and allows for a much higher throughput in the
+case that you need disk caching and still want to maintain a high peak throughput.
+
+
+                 ┌───────┐
+                 │ Item  |
+                 └───┬───┘
+                     │
+                     ▼
+              ┌─────────────┐
+              │             │
+              │   enqueue   │
+              │             │
+              │             │
+              └──────┬──────┘
+                     │
+                     │
+                     │
+ ┌───────────────┐   │    ┌──────────────┐
+ │               │   │    │              │
+ │   VecDeque    │   │    │  Lazy Disk   │
+ │               │◄──┴───►│    Writer    │
+ │               │        │              │
+ └───────┬───────┘        └──────────────┘
+         │
+         │
+         │
+         ▼
+ ┌───────────────┐         ┌─────────────┐
+ │               │         │             │
+ │    dequeue    │         │   Lazy Disk │
+ │               ├────────►│    Deleter  │
+ │               │         │             │
+ └───────────────┘         └─────────────┘
+
+*/
 
 pub struct RPQ<T: Ord + Clone + Send> {
     // options is the configuration for the RPQ
@@ -21,7 +68,7 @@ pub struct RPQ<T: Ord + Clone + Send> {
     // non_empty_buckets is a binary heap of priorities
     non_empty_buckets: bpq::BucketPriorityQueue,
     // buckets is a map of priorities to a binary heap of items
-    buckets: Arc<RwLock<HashMap<usize, pq::PriorityQueue<T>>>>,
+    buckets: Arc<HashMap<usize, pq::PriorityQueue<T>>>,
 
     // items_in_queues is the number of items across all queues
     items_in_queues: AtomicUsize,
@@ -96,7 +143,7 @@ where
         options: RPQOptions,
     ) -> Result<(Arc<RPQ<T>>, usize), Box<dyn std::error::Error>> {
         // Create base structures
-        let buckets = Arc::new(RwLock::new(HashMap::new()));
+        let mut buckets = HashMap::new();
         let items_in_queues = AtomicUsize::new(0);
         let sync_handles = Vec::new();
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -122,7 +169,7 @@ where
 
         // Create the buckets
         for i in 0..options.bucket_count {
-            buckets.write().await.insert(i, pq::PriorityQueue::new());
+            buckets.insert(i, pq::PriorityQueue::new());
         }
 
         let disk_cache: Option<Arc<Database>>;
@@ -138,7 +185,7 @@ where
         let rpq = RPQ {
             options,
             non_empty_buckets: bpq::BucketPriorityQueue::new(),
-            buckets,
+            buckets: Arc::new(buckets),
             items_in_queues,
             disk_cache,
             lazy_disk_writer_sender: Arc::new(lazy_disk_writer_sender),
@@ -240,8 +287,7 @@ where
         let priority = item.priority;
 
         // Get the bucket and enqueue the item
-        let buckets = self.buckets.read().await;
-        let bucket = buckets.get(&item.priority);
+        let bucket = self.buckets.get(&item.priority);
 
         if bucket.is_none() {
             return std::result::Result::Err(Box::<dyn std::error::Error>::from(
@@ -291,8 +337,6 @@ where
     }
 
     pub async fn dequeue(&self) -> Result<Option<pq::Item<T>>, Box<dyn std::error::Error>> {
-        let buckets = self.buckets.read().await;
-
         // Fetch the bucket
         let bucket_id = self.non_empty_buckets.peek();
         if bucket_id.is_none() {
@@ -303,7 +347,7 @@ where
         let bucket_id = bucket_id.unwrap();
 
         // Fetch the queue
-        let queue = buckets.get(&bucket_id);
+        let queue = self.buckets.get(&bucket_id);
         if queue.is_none() {
             return std::result::Result::Err(Box::<dyn std::error::Error>::from(
                 std::io::Error::new(std::io::ErrorKind::InvalidInput, "No items in queue"),
@@ -351,7 +395,7 @@ where
         let mut removed: usize = 0;
         let mut escalated: usize = 0;
 
-        for (_, active_bucket) in self.buckets.read().await.iter() {
+        for (_, active_bucket) in self.buckets.iter() {
             match active_bucket.prioritize() {
                 Ok((r, e)) => {
                     removed += r;
@@ -656,7 +700,7 @@ where
 
     pub async fn len(&self) -> usize {
         let mut len = 0 as usize;
-        for (_, active_bucket) in self.buckets.read().await.iter() {
+        for (_, active_bucket) in self.buckets.iter() {
             len += active_bucket.len();
         }
         len
