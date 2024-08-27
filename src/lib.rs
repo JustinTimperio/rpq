@@ -1,6 +1,6 @@
 use core::time;
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use redb::{Database, ReadableTableMetadata, TableDefinition};
@@ -21,10 +21,10 @@ pub struct RPQ<T: Ord + Clone + Send> {
     // non_empty_buckets is a binary heap of priorities
     non_empty_buckets: bpq::BucketPriorityQueue,
     // buckets is a map of priorities to a binary heap of items
-    buckets: Arc<RwLock<HashMap<u64, pq::PriorityQueue<T>>>>,
+    buckets: Arc<RwLock<HashMap<usize, pq::PriorityQueue<T>>>>,
 
     // items_in_queues is the number of items across all queues
-    items_in_queues: AtomicU64,
+    items_in_queues: AtomicUsize,
     // disk_cache maintains a cache of items that are in the queue
     disk_cache: Option<Arc<Database>>,
     // lazy_disk_channel is the channel for lazy disk writes
@@ -55,21 +55,21 @@ pub struct RPQ<T: Ord + Clone + Send> {
 
 struct BatchHandler {
     // synced_batches is a map of priorities to the last synced batch
-    synced_batches: HashMap<u64, bool>,
+    synced_batches: HashMap<usize, bool>,
     // deleted_batches is a map of priorities to the last deleted batch
-    deleted_batches: HashMap<u64, bool>,
+    deleted_batches: HashMap<usize, bool>,
 }
 
 struct BatchCounter {
     // message_counter is the counter for the number of messages that have been sent to the RPQ over the lifetime
-    message_counter: u64,
+    message_counter: usize,
     // batch_number is the current batch number
-    batch_number: u64,
+    batch_number: usize,
 }
 
 pub struct RPQOptions {
     // bucket_count is the number of buckets in the RPQ
-    pub bucket_count: u64,
+    pub bucket_count: usize,
     // disk_cache_enabled is a flag to enable or disable the disk cache
     pub disk_cache_enabled: bool,
     // disk_cache_path is the path to the disk cache
@@ -79,9 +79,9 @@ pub struct RPQOptions {
     // lazy_disk_max_delay is the maximum delay for lazy disk writes
     pub lazy_disk_max_delay: time::Duration,
     // lazy_disk_cache_batch_size is the maximum batch size for lazy disk writes
-    pub lazy_disk_cache_batch_size: u64,
+    pub lazy_disk_cache_batch_size: usize,
     // buffer_size is the size of the buffer for the disk cache
-    pub buffer_size: u64,
+    pub buffer_size: usize,
 }
 
 const DB: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
@@ -90,10 +90,14 @@ impl<T: Ord + Clone + Send + Sync> RPQ<T>
 where
     T: Serialize + DeserializeOwned + 'static,
 {
-    pub async fn new(options: RPQOptions) -> (Arc<RPQ<T>>, u64) {
+    // new creates a new RPQ with the given options
+    // It returns the RPQ and the number of items restored from the disk cache
+    pub async fn new(
+        options: RPQOptions,
+    ) -> Result<(Arc<RPQ<T>>, usize), Box<dyn std::error::Error>> {
         // Create base structures
         let buckets = Arc::new(RwLock::new(HashMap::new()));
-        let items_in_queues = AtomicU64::new(0);
+        let items_in_queues = AtomicUsize::new(0);
         let sync_handles = Vec::new();
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
         let (batch_shutdown_sender, batch_shutdown_receiver) = watch::channel(false);
@@ -152,7 +156,7 @@ where
         let rpq = Arc::new(rpq);
 
         // Restore the items from the disk cache
-        let mut restored_items: u64 = 0;
+        let mut restored_items: usize = 0;
         if disk_cache_enabled {
             // Create a the initial table
             let ctxn = rpq.disk_cache.as_ref().unwrap().begin_write().unwrap();
@@ -165,47 +169,73 @@ where
             let cursor = match table.range::<&str>(..) {
                 Ok(range) => range,
                 Err(e) => {
-                    panic!("Error opening range: {}", e);
+                    return Err(Box::<dyn std::error::Error>::from(e));
                 }
             };
 
             for (_i, entry) in cursor.enumerate() {
                 match entry {
                     Ok((_key, value)) => {
-                        let mut item = pq::Item::from_bytes(value.value());
+                        let item = pq::Item::from_bytes(value.value());
+
+                        if item.is_err() {
+                            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "Error reading from disk cache",
+                            )));
+                        }
+
                         // Mark the item as restored
-                        item.set_restored();
-                        rpq.enqueue(item).await;
+                        let mut i = item.unwrap();
+                        i.set_restored();
+                        let result = rpq.enqueue(i).await;
+                        if result.is_err() {
+                            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                                std::io::ErrorKind::InvalidInput,
+                                "Error enqueueing item from the disk cache",
+                            )));
+                        }
                         restored_items += 1;
                     }
                     Err(e) => {
-                        println!("Error reading from disk cache: {}", e);
-                        continue;
+                        return Err(Box::<dyn std::error::Error>::from(e));
                     }
                 }
             }
             _ = read_txn.close();
-            println!("Restored {} items from disk cache", restored_items);
 
             let mut handles = rpq.sync_handles.lock().await;
             let rpq_clone = Arc::clone(&rpq);
             handles.push(tokio::spawn(async move {
-                rpq_clone.lazy_disk_writer().await;
+                let result = rpq_clone.lazy_disk_writer().await;
+                if result.is_err() {
+                    println!("Error in lazy disk writer: {:?}", result.err().unwrap());
+                }
             }));
 
             let rpq_clone = Arc::clone(&rpq);
             handles.push(tokio::spawn(async move {
-                rpq_clone.lazy_disk_deleter().await;
+                let result = rpq_clone.lazy_disk_deleter().await;
+                if result.is_err() {
+                    println!("Error in lazy disk deleter: {:?}", result.err().unwrap());
+                }
             }));
         }
-        return (rpq, restored_items);
+        Ok((rpq, restored_items))
     }
 
-    pub async fn enqueue(&self, mut item: pq::Item<T>) {
+    pub async fn enqueue(
+        &self,
+        mut item: pq::Item<T>,
+    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Check if the item priority is greater than the bucket count
         if item.priority >= self.options.bucket_count {
-            println!("Item priority is greater than bucket count");
-            return;
+            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Priority is greater than bucket count",
+                ),
+            ));
         }
         let priority = item.priority;
 
@@ -214,8 +244,9 @@ where
         let bucket = buckets.get(&item.priority);
 
         if bucket.is_none() {
-            println!("Bucket is none for id: {}", priority);
-            return;
+            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Bucket does not exist"),
+            ));
         }
 
         // If the disk cache is enabled, send the item to the lazy disk writer
@@ -235,12 +266,20 @@ where
                 if self.options.lazy_disk_cache {
                     let lazy_disk_writer_sender = &self.lazy_disk_writer_sender;
                     let was_sent = lazy_disk_writer_sender.send(item.clone()).await;
-                    if was_sent.is_err() {
-                        println!("Error sending item to lazy disk writer");
-                        return;
+                    match was_sent {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Err(Box::<dyn std::error::Error>::from(e));
+                        }
                     }
                 } else {
-                    self.commit_single(item.clone());
+                    let result = self.commit_single(item.clone());
+                    match result {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return std::result::Result::Err(e);
+                        }
+                    }
                 }
             }
         }
@@ -248,28 +287,35 @@ where
         // Enqueue the item and update
         bucket.unwrap().enqueue(item);
         self.non_empty_buckets.add_bucket(priority);
+        Ok(())
     }
 
-    pub async fn dequeue(&self) -> Option<pq::Item<T>> {
+    pub async fn dequeue(&self) -> Result<Option<pq::Item<T>>, Box<dyn std::error::Error>> {
         let buckets = self.buckets.read().await;
 
         // Fetch the bucket
         let bucket_id = self.non_empty_buckets.peek();
         if bucket_id.is_none() {
-            return None;
+            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "No items in queue"),
+            ));
         }
         let bucket_id = bucket_id.unwrap();
 
         // Fetch the queue
         let queue = buckets.get(&bucket_id);
         if queue.is_none() {
-            return None;
+            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "No items in queue"),
+            ));
         }
 
         // Fetch the item from the bucket
         let item = queue.unwrap().dequeue();
         if item.is_none() {
-            return None;
+            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
+                std::io::Error::new(std::io::ErrorKind::InvalidInput, "No items in queue"),
+            ));
         }
         self.items_in_queues.fetch_sub(1, Ordering::SeqCst);
         let item = item.unwrap();
@@ -284,36 +330,44 @@ where
             if self.options.lazy_disk_cache {
                 let lazy_disk_delete_sender = &self.lazy_disk_delete_sender;
                 let was_sent = lazy_disk_delete_sender.send(item_clone).await;
-                if was_sent.is_err() {
-                    println!("Error sending item to lazy disk delete");
-                    return None;
+                match was_sent {
+                    Ok(_) => {}
+                    Err(e) => {
+                        return std::result::Result::Err(Box::new(e));
+                    }
                 }
             } else {
-                self.delete_single(item_clone.get_disk_uuid().unwrap().as_ref());
+                let result = self.delete_single(item_clone.get_disk_uuid().unwrap().as_ref());
+                if result.is_err() {
+                    return std::result::Result::Err(result.err().unwrap());
+                }
             }
         }
 
-        Some(item)
+        Ok(Some(item))
     }
 
-    pub async fn prioritize(&self) -> Option<(u64, u64)> {
-        let mut removed = 0;
-        let mut escalated = 0;
+    pub async fn prioritize(&self) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+        let mut removed: usize = 0;
+        let mut escalated: usize = 0;
 
         for (_, active_bucket) in self.buckets.read().await.iter() {
-            let results = active_bucket.prioritize();
-            if results.is_none() {
-                continue;
+            match active_bucket.prioritize() {
+                Ok((r, e)) => {
+                    removed += r;
+                    escalated += e;
+                }
+                Err(err) => {
+                    return Err(Box::<dyn std::error::Error>::from(err));
+                }
             }
-            removed += results.unwrap().0;
-            escalated += results.unwrap().1;
         }
         self.items_in_queues.fetch_sub(removed, Ordering::SeqCst);
-        Some((removed, escalated))
+        Ok((removed, escalated))
     }
 
-    async fn lazy_disk_writer(&self) {
-        let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
+    async fn lazy_disk_writer(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut awaiting_batches = HashMap::<usize, Vec<pq::Item<T>>>::new();
         let mut ticker = interval(self.options.lazy_disk_max_delay);
         let mut receiver = self.lazy_disk_writer_receiver.lock().await;
         let mut shutdown_receiver = self.shutdown_receiver.clone();
@@ -329,7 +383,10 @@ where
                         if *batch_handler.deleted_batches.get(id).unwrap_or(&false) {
                             batch.clear();
                         } else {
-                            self.commit_batch(batch);
+                            let result = self.commit_batch(batch);
+                            if result.is_err() {
+                                return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                            }
                         }
                         batch_handler.synced_batches.insert(*id, true);
                         batch_handler.deleted_batches.insert(*id, false);
@@ -343,14 +400,17 @@ where
                         let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
                         batch.push(item);
 
-                        if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size {
+                        if batch.len() >= self.options.lazy_disk_cache_batch_size {
                             let mut shandler = self.batch_handler.lock().await;
 
                             if *shandler.deleted_batches.get(&batch_bucket).unwrap_or(&false) {
                                 batch.clear();
                                 awaiting_batches.remove(&batch_bucket);
                             } else {
-                                self.commit_batch(batch);
+                                let result = self.commit_batch(batch);
+                                if result.is_err() {
+                                    return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                                }
                                 awaiting_batches.remove(&batch_bucket);
                             }
 
@@ -382,18 +442,21 @@ where
 
                         batch_handler.synced_batches.insert(*id, true);
                         batch_handler.deleted_batches.insert(*id, false);
-                        self.commit_batch(batch);
+                        let result = self.commit_batch(batch);
+                        if result.is_err() {
+                            return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                        }
                     }
                     self.batch_shutdown_sender.send(true).unwrap();
 
-                    break;
+                    break Ok(());
                 }
             }
         }
     }
 
-    async fn lazy_disk_deleter(&self) {
-        let mut awaiting_batches = HashMap::<u64, Vec<pq::Item<T>>>::new();
+    async fn lazy_disk_deleter(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let mut awaiting_batches = HashMap::<usize, Vec<pq::Item<T>>>::new();
         let mut restored_items: Vec<pq::Item<T>> = Vec::new();
         let mut receiver = self.lazy_disk_delete_receiver.lock().await;
         let mut shutdown_receiver = self.batch_shutdown_receiver.clone();
@@ -407,8 +470,11 @@ where
                         if item.was_restored() {
                             restored_items.push(item);
 
-                            if restored_items.len() as u64 >= self.options.lazy_disk_cache_batch_size {
-                                self.delete_batch(&mut restored_items);
+                            if restored_items.len() >= self.options.lazy_disk_cache_batch_size {
+                                let result = self.delete_batch(&mut restored_items);
+                                if result.is_err() {
+                                    return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                                }
                                 restored_items.clear();
                             }
                             continue;
@@ -420,11 +486,14 @@ where
                         batch.push(item);
 
                         // Check if the batch is full
-                        if batch.len() as u64 >= self.options.lazy_disk_cache_batch_size {
+                        if batch.len() >= self.options.lazy_disk_cache_batch_size {
                             let mut batch_handler = self.batch_handler.lock().await;
                             let was_synced = batch_handler.synced_batches.get(&batch_bucket).unwrap_or(&false);
                             if *was_synced {
-                                self.delete_batch(batch);
+                                let result = self.delete_batch(batch);
+                                if result.is_err() {
+                                    return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                                }
                                 awaiting_batches.remove(&batch_bucket);
                             } else {
                                 batch.clear();
@@ -456,14 +525,20 @@ where
 
                     // Commit the remaining batches
                     if !restored_items.is_empty() {
-                        self.delete_batch(&mut restored_items);
+                        let result = self.delete_batch(&mut restored_items);
+                        if result.is_err() {
+                            return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                        }
                         restored_items.clear();
                     }
                     for (id, batch) in awaiting_batches.iter_mut() {
                         let mut batch_handler = self.batch_handler.lock().await;
                         let was_synced = batch_handler.synced_batches.get(id).unwrap_or(&false);
                         if *was_synced {
-                            self.delete_batch(batch);
+                            let result = self.delete_batch(batch);
+                            if result.is_err() {
+                                return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                            }
                         } else {
                             batch.clear();
                         }
@@ -471,94 +546,127 @@ where
                         batch_handler.synced_batches.insert(*id, false);
                     }
 
-                    break;
+                    break Ok(());
                 }
             }
         }
     }
 
-    fn commit_batch(&self, write_cache: &mut Vec<pq::Item<T>>) {
+    fn commit_batch(
+        &self,
+        write_cache: &mut Vec<pq::Item<T>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         for item in write_cache.iter() {
             let mut table = write_txn.open_table(DB).unwrap();
             // Convert to bytes
             let b = item.to_bytes();
+            if b.is_err() {
+                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Error converting item to bytes",
+                )));
+            }
+
+            let b = b.unwrap();
             let key = item.get_disk_uuid().unwrap();
 
             let was_written = table.insert(key.as_str(), &b[..]);
             if was_written.is_err() {
-                println!("Error writing item to disk cache");
-                continue;
+                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Error writing item to disk cache",
+                )));
             }
         }
 
         write_txn.commit().unwrap();
         write_cache.clear();
+        Ok(())
     }
 
-    fn delete_batch(&self, delete_cache: &mut Vec<pq::Item<T>>) {
+    fn delete_batch(
+        &self,
+        delete_cache: &mut Vec<pq::Item<T>>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         for item in delete_cache.iter() {
             let mut table = write_txn.open_table(DB).unwrap();
-            // Convert to bytes
             let key = item.get_disk_uuid().unwrap();
-
             let was_deleted = table.remove(key.as_str());
             if was_deleted.is_err() {
-                println!("Error deleting item from disk cache");
-                continue;
+                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Error deleting item from disk cache",
+                )));
             }
         }
 
         write_txn.commit().unwrap();
         delete_cache.clear();
+        Ok(())
     }
 
-    fn commit_single(&self, item: pq::Item<T>) {
+    fn commit_single(&self, item: pq::Item<T>) -> Result<(), Box<dyn std::error::Error>> {
         let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         {
             let mut table = write_txn.open_table(DB).unwrap();
             // Convert to bytes
             let b = item.to_bytes();
+
+            if b.is_err() {
+                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Error converting item to bytes",
+                )));
+            }
+
             let key = item.get_disk_uuid().unwrap();
+            let b = b.unwrap();
 
             let was_written = table.insert(key.as_str(), &b[..]);
             if was_written.is_err() {
-                println!("Error writing item to disk cache");
-                return;
+                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Error writing item to disk cache",
+                )));
             }
         }
 
         write_txn.commit().unwrap();
+        Ok(())
     }
 
-    fn delete_single(&self, key: &str) {
+    fn delete_single(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
         let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         {
             let mut table = write_txn.open_table(DB).unwrap();
             let was_written = table.remove(key);
             if was_written.is_err() {
-                println!("Error writing item to disk cache");
-                return;
+                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "Error deleting item from disk cache",
+                )));
             }
         }
 
         write_txn.commit().unwrap();
+        Ok(())
     }
 
-    pub async fn len(&self) -> u64 {
-        let mut len = 0 as u64;
+    pub async fn len(&self) -> usize {
+        let mut len = 0 as usize;
         for (_, active_bucket) in self.buckets.read().await.iter() {
             len += active_bucket.len();
         }
         len
     }
 
-    pub fn active_buckets(&self) -> u64 {
+    pub fn active_buckets(&self) -> usize {
         self.non_empty_buckets.len()
     }
 
-    pub async fn unsynced_batches(&self) -> u64 {
+    pub async fn unsynced_batches(&self) -> usize {
         let mut unsynced_batches = 0;
         let batch_handler = self.batch_handler.lock().await;
         for (_, synced) in batch_handler.synced_batches.iter() {
@@ -598,7 +706,11 @@ where
 mod tests {
     use super::*;
     use core::time;
-    use std::{collections::VecDeque, sync::atomic::AtomicBool};
+    use std::{
+        collections::VecDeque,
+        error::Error,
+        sync::atomic::{AtomicBool, AtomicUsize},
+    };
 
     #[tokio::test(flavor = "multi_thread")]
     async fn order_test() {
@@ -614,7 +726,8 @@ mod tests {
             buffer_size: 1_000_000,
         };
 
-        let r = Arc::new(RPQ::new(options).await);
+        let r: Result<(Arc<RPQ<usize>>, usize), Box<dyn Error>> = RPQ::new(options).await;
+        let r = r.unwrap();
         let rpq = Arc::clone(&r.0);
 
         let mut expected_data = HashMap::new();
@@ -627,13 +740,20 @@ mod tests {
                 false,
                 Some(std::time::Duration::from_secs(5)),
             );
-            rpq.enqueue(item).await;
+            let result = rpq.enqueue(item).await;
+            if result.is_err() {
+                panic!("Error enqueueing item");
+            }
             let v = expected_data.entry(i % 10).or_insert(VecDeque::new());
             v.push_back(i);
         }
 
         for _i in 0..message_count {
-            let item = rpq.dequeue().await.unwrap();
+            let item = rpq.dequeue().await;
+            if item.is_err() {
+                panic!("Item is None");
+            }
+            let item = item.unwrap().unwrap();
             let v = expected_data.get_mut(&item.priority).unwrap();
             let expected_data = v.pop_front().unwrap();
             assert!(item.data == expected_data);
@@ -643,17 +763,18 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn e2e_test() {
         // Set Message Count
-        let message_count = 500_000;
+        let message_count = 500_000 as usize;
 
         // Set Concurrency
-        let send_threads = 4;
-        let receive_threads = 4;
-        let bucket_count = 10;
-        let sent_counter = Arc::new(AtomicU64::new(0));
-        let received_counter = Arc::new(AtomicU64::new(0));
-        let removed_counter = Arc::new(AtomicU64::new(0));
-        let total_escalated = Arc::new(AtomicU64::new(0));
+        let send_threads = 4 as usize;
+        let receive_threads = 4 as usize;
+        let bucket_count = 10 as usize;
+        let sent_counter = Arc::new(AtomicUsize::new(0));
+        let received_counter = Arc::new(AtomicUsize::new(0));
+        let removed_counter = Arc::new(AtomicUsize::new(0));
+        let total_escalated = Arc::new(AtomicUsize::new(0));
         let finshed_sending = Arc::new(AtomicBool::new(false));
+        let max_retries = 1000;
 
         // Create the RPQ
         let options = RPQOptions {
@@ -665,8 +786,11 @@ mod tests {
             lazy_disk_cache_batch_size: 5000,
             buffer_size: 500_000,
         };
-        let r = Arc::new(RPQ::new(options).await);
-
+        let r = RPQ::new(options).await;
+        if r.is_err() {
+            panic!("Error creating RPQ");
+        }
+        let r = r.unwrap();
         let rpq = Arc::clone(&r.0);
         let restored_items = r.1;
 
@@ -685,7 +809,7 @@ mod tests {
                         tokio::time::sleep(time::Duration::from_secs(10)).await;
                         let results = rpq_clone.prioritize().await;
 
-                        if !results.is_none() {
+                        if !results.is_ok() {
                             let (removed, escalated) = results.unwrap();
                             removed_clone.fetch_add(removed, Ordering::SeqCst);
                             escalated_clone.fetch_add(escalated, Ordering::SeqCst);
@@ -721,7 +845,10 @@ mod tests {
                         Some(std::time::Duration::from_secs(5)),
                     );
 
-                    rpq_clone.enqueue(item).await;
+                    let result = rpq_clone.enqueue(item).await;
+                    if result.is_err() {
+                        panic!("Error enqueueing item");
+                    }
                     sent_clone.fetch_add(1, Ordering::SeqCst);
                 }
                 println!("Finished Sending");
@@ -742,6 +869,7 @@ mod tests {
 
             // Spawn the thread
             receive_handles.push(tokio::spawn(async move {
+                let mut counter = 0;
                 loop {
                     if finshed_sending_clone.load(Ordering::SeqCst) {
                         if received_clone.load(Ordering::SeqCst)
@@ -753,10 +881,15 @@ mod tests {
                     }
 
                     let item = rpq_clone.dequeue().await;
-                    if item.is_none() {
+                    if item.is_err() {
+                        if counter >= max_retries {
+                            panic!("Reached max retries waiting for items!");
+                        }
+                        counter += 1;
+                        std::thread::sleep(time::Duration::from_millis(100));
                         continue;
                     }
-
+                    counter = 0;
                     received_clone.fetch_add(1, Ordering::SeqCst);
                 }
             }));

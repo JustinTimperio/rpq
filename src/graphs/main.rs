@@ -63,12 +63,12 @@ async fn iter(prioritize: bool, disk_cache: bool, lazy_disk_cache: bool) {
 }
 
 async fn bench(
-    message_count: u64,
-    bucket_count: u64,
+    message_count: usize,
+    bucket_count: usize,
     prioritize: bool,
     lazy_disk_cache: bool,
     disk_cache_enabled: bool,
-) -> (f64, f64, f64, u64, u64) {
+) -> (f64, f64, f64, usize, usize) {
     let options = RPQOptions {
         bucket_count: bucket_count,
         disk_cache_enabled: disk_cache_enabled,
@@ -79,11 +79,14 @@ async fn bench(
         buffer_size: 1_000_000,
     };
 
-    let r = Arc::new(RPQ::new(options).await);
-    let rpq = Arc::clone(&r.0);
+    let r = RPQ::new(options).await;
+    if r.is_err() {
+        panic!("Failed to create RPQ: {:?}", r.err().unwrap());
+    }
+    let rpq = Arc::clone(&r.unwrap().0);
 
-    let removed = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let escalated = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    let removed = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let escalated = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let (shutdown_sender, mut shutdown_receiver) = tokio::sync::watch::channel(false);
 
     let rpq_clone = Arc::clone(&rpq);
@@ -100,7 +103,7 @@ async fn bench(
                         tokio::time::sleep(time::Duration::from_secs(1)).await;
                         let results = rpq_clone.prioritize().await;
 
-                        if !results.is_none() {
+                        if !results.is_err() {
                             let (r, e) = results.unwrap();
                             removed_clone.fetch_add(r, Ordering::SeqCst);
                             escalated_clone.fetch_add(e, Ordering::SeqCst);
@@ -122,14 +125,20 @@ async fn bench(
             true,
             Some(std::time::Duration::from_secs(2)),
         );
-        rpq.enqueue(item).await;
+        let result = rpq.enqueue(item).await;
+        if result.is_err() {
+            panic!("Failed to enqueue item: {:?}", result.err().unwrap());
+        }
     }
 
     let send_elapsed = send_timer.elapsed().as_secs_f64();
 
     let receive_timer = std::time::Instant::now();
     for _i in 0..message_count {
-        rpq.dequeue().await;
+        let result = rpq.dequeue().await;
+        if result.is_err() {
+            panic!("Failed to dequeue item: {:?}", result.err().unwrap());
+        }
     }
     let receive_elapsed = receive_timer.elapsed().as_secs_f64();
     shutdown_sender.send(true).unwrap();

@@ -1,3 +1,4 @@
+use std::error::Error;
 use std::time::Duration;
 use std::{collections::VecDeque, sync::RwLock};
 
@@ -8,6 +9,9 @@ use serde::{Deserialize, Serialize};
 
 mod ftime;
 
+// PriorityQueue is a struct that holds methods for inserting, removing, and prioritizing items
+// in a queue. Items are stored in a VecDeque and are prioritized based on the priority field.
+// Items can be escalated or timed out based on the should_escalate and can_timeout fields.
 pub struct PriorityQueue<T: Ord + Clone + Send> {
     items: RwLock<VecDeque<Item<T>>>,
     ftime: ftime::CachedTime,
@@ -21,8 +25,8 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         }
     }
 
-    pub fn len(&self) -> u64 {
-        self.items.read().unwrap().len() as u64
+    pub fn len(&self) -> usize {
+        self.items.read().unwrap().len()
     }
 
     pub fn enqueue(&self, item: Item<T>) {
@@ -40,55 +44,66 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         self.items.write().unwrap().pop_front()
     }
 
-    pub fn prioritize(&self) -> Option<(u64, u64)> {
+    pub fn prioritize(&self) -> Result<(usize, usize), Box<dyn Error>> {
         let mut items = self.items.write().unwrap();
         let mut to_remove = Vec::new();
         let mut to_swap = Vec::new();
+        let mut was_error = false;
 
         for (index, item) in items.iter_mut().enumerate() {
             // Timeout items that have been in the queue for too long
             if item.can_timeout {
                 if let (Some(timeout), Some(submitted_at)) = (item.timeout, item.submitted_at) {
-                    let current_time_millis = self.ftime.get_time().timestamp_millis() as u128;
-                    let submitted_time_millis = submitted_at.timestamp_millis() as u128;
+                    let current_time_millis = self.ftime.get_time().timestamp_millis();
+                    let submitted_time_millis = submitted_at.timestamp_millis();
                     let elapsed_time = current_time_millis - submitted_time_millis;
 
-                    if elapsed_time >= timeout.as_millis() {
-                        to_remove.push(index);
-                        continue;
+                    // Downcast u128 to i64 to compare with the timeout
+                    if timeout.as_millis() <= i64::MAX as u128 {
+                        if elapsed_time >= timeout.as_millis() as i64 {
+                            to_remove.push(index);
+                            continue;
+                        }
+                    } else {
+                        was_error = true;
                     }
                 }
             }
 
             // Escalate items that have been in the queue for too long
             if item.should_escalate {
-                let current_time_millis = self.ftime.get_time().timestamp_millis() as u128;
-                let submitted_time_millis = item.submitted_at.unwrap().timestamp_millis() as u128;
+                let current_time_millis = self.ftime.get_time().timestamp_millis();
+                let submitted_time_millis = item.submitted_at.unwrap().timestamp_millis();
                 let escalation_rate_millis = item.escalation_rate.unwrap().as_millis();
 
-                // Check if we have ever escalated this item
-                if item.last_escalation.is_none() {
-                    let elapsed_time = current_time_millis - submitted_time_millis;
+                // Downcast u128 to i64 to compare with the timeout
+                if !item.timeout.unwrap().as_millis() <= i64::MAX as u128 {
+                    // Check if we have ever escalated this item
+                    if item.last_escalation.is_none() {
+                        let elapsed_time = current_time_millis - submitted_time_millis;
 
-                    if elapsed_time > escalation_rate_millis {
-                        item.last_escalation = Some(self.ftime.get_time());
-                        if index > 0 {
-                            to_swap.push(index);
+                        if elapsed_time > escalation_rate_millis as i64 {
+                            item.last_escalation = Some(self.ftime.get_time());
+                            if index > 0 {
+                                to_swap.push(index);
+                            }
+                        }
+                    } else {
+                        let last_escalation_time_millis =
+                            item.last_escalation.unwrap().timestamp_millis();
+                        let time_since_last_escalation =
+                            current_time_millis - last_escalation_time_millis;
+
+                        // Check if we need to escalate this item again
+                        if time_since_last_escalation >= escalation_rate_millis as i64 {
+                            item.last_escalation = Some(self.ftime.get_time());
+                            if index > 0 {
+                                to_swap.push(index);
+                            }
                         }
                     }
                 } else {
-                    let last_escalation_time_millis =
-                        item.last_escalation.unwrap().timestamp_millis() as u128;
-                    let time_since_last_escalation =
-                        current_time_millis - last_escalation_time_millis;
-
-                    // Check if we need to escalate this item again
-                    if time_since_last_escalation >= escalation_rate_millis {
-                        item.last_escalation = Some(self.ftime.get_time());
-                        if index > 0 {
-                            to_swap.push(index);
-                        }
-                    }
+                    was_error = true;
                 }
             }
         }
@@ -104,7 +119,14 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
             items.swap(index, index - 1);
         }
 
-        return Some((removed as u64, swapped as u64));
+        if was_error {
+            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Timeout or escalation rate is too large",
+            )));
+        }
+
+        Ok((removed, swapped))
     }
 }
 
@@ -112,7 +134,7 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Item<T: Clone + Send> {
     // User
-    pub priority: u64,
+    pub priority: usize,
     pub data: T,
     pub should_escalate: bool,
     pub escalation_rate: Option<Duration>,
@@ -123,14 +145,14 @@ pub struct Item<T: Clone + Send> {
     disk_uuid: Option<String>,
     submitted_at: Option<DateTime<Utc>>,
     last_escalation: Option<DateTime<Utc>>,
-    batch_id: u64,
+    batch_id: usize,
     was_restored: bool,
 }
 
 impl<T: Clone + Send> Item<T> {
     // Constructor to initialize the struct
     pub fn new(
-        priority: u64,
+        priority: usize,
         data: T,
         should_escalate: bool,
         escalation_rate: Option<Duration>,
@@ -158,19 +180,18 @@ impl<T: Clone + Send> Item<T> {
     }
 
     pub fn set_disk_uuid(&mut self) {
-        let id = uuid::Uuid::new_v4().to_string();
-        self.disk_uuid = Some(id);
+        self.disk_uuid = Some(uuid::Uuid::new_v4().to_string());
     }
 
     pub fn get_disk_uuid(&self) -> Option<String> {
         self.disk_uuid.clone()
     }
 
-    pub fn set_batch_id(&mut self, batch_id: u64) {
+    pub fn set_batch_id(&mut self, batch_id: usize) {
         self.batch_id = batch_id;
     }
 
-    pub fn get_batch_id(&self) -> u64 {
+    pub fn get_batch_id(&self) -> usize {
         self.batch_id
     }
 
@@ -182,17 +203,31 @@ impl<T: Clone + Send> Item<T> {
         self.was_restored
     }
 
-    pub fn from_bytes(bytes: &[u8]) -> Self
+    pub fn from_bytes(bytes: &[u8]) -> Result<Item<T>, Box<dyn Error>>
     where
         T: Serialize + DeserializeOwned,
     {
-        deserialize(bytes).unwrap()
+        let b = bytes.to_vec();
+        if b.is_empty() {
+            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Empty byte array",
+            )));
+        }
+        Ok(deserialize(&b).unwrap())
     }
 
-    pub fn to_bytes(&self) -> Vec<u8>
+    pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn Error>>
     where
         T: Serialize + DeserializeOwned,
     {
-        serialize(&self).unwrap()
+        let b = serialize(&self).unwrap();
+        if b.is_empty() {
+            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "Empty byte array",
+            )));
+        }
+        Ok(b)
     }
 }
