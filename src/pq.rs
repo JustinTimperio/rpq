@@ -9,15 +9,16 @@ use serde::{Deserialize, Serialize};
 
 mod ftime;
 
-// PriorityQueue is a struct that holds methods for inserting, removing, and prioritizing items
-// in a queue. Items are stored in a VecDeque and are prioritized based on the priority field.
-// Items can be escalated or timed out based on the should_escalate and can_timeout fields.
+/// PriorityQueue is a struct that holds methods for inserting, removing, and prioritizing items
+/// in a queue. Items are stored in a VecDeque and are prioritized based on metadata provided by the user.
+/// Items can be escalated or timed out based on the should_escalate and can_timeout fields.
 pub struct PriorityQueue<T: Ord + Clone + Send> {
     items: RwLock<VecDeque<Item<T>>>,
     ftime: ftime::CachedTime,
 }
 
 impl<T: Ord + Clone + Send> PriorityQueue<T> {
+    /// This function creates a new PriorityQueue.
     pub fn new() -> PriorityQueue<T> {
         PriorityQueue {
             items: RwLock::new(VecDeque::new()),
@@ -25,10 +26,12 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         }
     }
 
+    /// Returns the number of items in this queue
     pub fn len(&self) -> usize {
         self.items.read().unwrap().len()
     }
 
+    /// Adds an item to the queue at the end of the VecDeque
     pub fn enqueue(&self, item: Item<T>) {
         let mut item = item;
 
@@ -40,10 +43,13 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         self.items.write().unwrap().push_back(item);
     }
 
+    /// Removes and returns the item with the highest priority
     pub fn dequeue(&self) -> Option<Item<T>> {
         self.items.write().unwrap().pop_front()
     }
 
+    /// Prioritizes the items in the queue based on the priority, escalation rate, and timeout
+    /// Returns a tuple of the number of items removed and the number of items swapped
     pub fn prioritize(&self) -> Result<(usize, usize), Box<dyn Error>> {
         let mut items = self.items.write().unwrap();
         let mut to_remove = Vec::new();
@@ -130,15 +136,26 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
     }
 }
 
-// Item is a struct that holds the data and metadata for an item in the queue
+/// Item holds the data that you want to store along with the metadata needed to manage the item.
+/// The priority field is used to determine the order in which items are dequeued. The lower the
+/// value, the higher the priority. Items will NOT escalate to a new priority level but instead
+/// items will be escalated up or down within there same priority level. AKA, items are not promoted
+/// to a higher priority level no matter how long they are in the queue.
 #[derive(Serialize, Deserialize, Clone)]
 pub struct Item<T: Clone + Send> {
-    // User
+    // User-provided fields
+    /// The priority of the item. Lower values are higher priority.
+    /// Be sure that this value does not exceed the max_priority value set when creating the queue.
     pub priority: usize,
+    /// The data associated with the item.
     pub data: T,
+    /// Whether the item should be escalated over time.
     pub should_escalate: bool,
+    /// The rate at which the item should be escalated.
     pub escalation_rate: Option<Duration>,
+    /// Whether the item should be timed out.
     pub can_timeout: bool,
+    /// The timeout duration for the item.
     pub timeout: Option<Duration>,
 
     // Internal
@@ -150,7 +167,7 @@ pub struct Item<T: Clone + Send> {
 }
 
 impl<T: Clone + Send> Item<T> {
-    // Constructor to initialize the struct
+    /// This function creates a new Item with the provided fields.
     pub fn new(
         priority: usize,
         data: T,
@@ -179,30 +196,37 @@ impl<T: Clone + Send> Item<T> {
         }
     }
 
+    // This function is for internal use only. It sets the disk_uuid field to a random UUID.
     pub fn set_disk_uuid(&mut self) {
         self.disk_uuid = Some(uuid::Uuid::new_v4().to_string());
     }
 
+    // This function is for internal use only. It returns the disk_uuid field.
     pub fn get_disk_uuid(&self) -> Option<String> {
         self.disk_uuid.clone()
     }
 
+    /// This function is for internal use only. It sets the batch_id field.
     pub fn set_batch_id(&mut self, batch_id: usize) {
         self.batch_id = batch_id;
     }
 
+    /// This function is for internal use only. It returns the batch_id field.
     pub fn get_batch_id(&self) -> usize {
         self.batch_id
     }
 
+    /// This function is for internal use only. It sets the was_restored field to true.
     pub fn set_restored(&mut self) {
         self.was_restored = true;
     }
 
+    /// This function is for internal use only. It returns the was_restored field.
     pub fn was_restored(&self) -> bool {
         self.was_restored
     }
 
+    /// This function is for internal use only. It returns creates a new Item from a serialized byte array.
     pub fn from_bytes(bytes: &[u8]) -> Result<Item<T>, Box<dyn Error>>
     where
         T: Serialize + DeserializeOwned,
@@ -217,6 +241,7 @@ impl<T: Clone + Send> Item<T> {
         Ok(deserialize(&b).unwrap())
     }
 
+    /// This function is for internal use only. It returns a serialized byte array from an Item.
     pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn Error>>
     where
         T: Serialize + DeserializeOwned,

@@ -1,67 +1,80 @@
-///! RPQ implements a priority queue that is optimized for high throughput and low latency.
-///!
-///! The RPQ should always be created with the new function like so:
-///!
-///! ```
-///! let options = RPQOptions {
-///!    bucket_count: 10,
-///!    disk_cache_enabled: true,
-///!    database_path: "/path/rpq.db".to_string(),
-///!    lazy_disk_cache: true,
-///!    lazy_disk_write_delay: time::Duration::from_secs(5),
-///!    lazy_disk_cache_batch_size: 10000,
-///!    buffer_size: 1_000_000,
-///! };
-///!
-///! let r = RPQ::new(options).await;
-///! ```
-///!
-///! Architecture Notes:
-///! In many ways, RPQ slighty compromises the performance of a traditional priority queue in order to provide
-///! a variety of features that are useful when absorbing distributed load from many down or upstream services.
-///! It employs a fairly novel techinique that allows us to lazily write and delete items from a disk cache while
-///! still maintaining data in memory. This basically means that a object can be added to the queue and then removed
-///! without the disk commit ever blocking the processes sending or reciving the data. In the case that a batch of data
-///! has already been removed from the queue before it is written to disk, the data is simply discarded. This
-///! dramaically reduces the amount of time spent doing disk commits and allows for much better performance in the
-///! case that you need disk caching and still want to maintain a high peak throughput.
-///!
-///!
-///!                 ┌───────┐
-///!                 │ Item  │
-///!                 └───┬───┘
-///!                     │
-///!                     ▼
-///!              ┌─────────────┐
-///!              │             │
-///!              │   enqueue   │
-///!              │             │
-///!              │             │
-///!              └──────┬──────┘
-///!                     │
-///!                     │
-///!                     │
-///! ┌───────────────┐   │    ┌──────────────┐
-///! │               │   │    │              │      ┌───┐
-///! │   VecDeque    │   │    │  Lazy Disk   │      │   │
-///! │               │◄──┴───►│    Writer    ├─────►│ D │
-///! │               │        │              │      │ i │
-///! └───────┬───────┘        └──────────────┘      │ s │
-///!         │                                      │ k │
-///!         │                                      │   │
-///!         │                                      │ C │
-///!         ▼                                      │ a │
-///! ┌───────────────┐         ┌─────────────┐      │ c │
-///! │               │         │             │      │ h │
-///! │    dequeue    │         │   Lazy Disk ├─────►│ e │
-///! │               ├────────►│    Deleter  │      │   │
-///! │               │         │             │      └───┘
-///! └───────┬───────┘         └─────────────┘
-///!         │
-///!         ▼
-///!      ┌──────┐
-///!      │ Item │
-///!      └──────┘
+//! # RPQ
+//! RPQ implements a in memory, disk cached priority queue that is optimized for high throughput and low latency
+//! while still maintaining strict ordering guarantees and durability.
+//!
+//!  # Create a new RPQ
+//! The RPQ should always be created with the new function like so:
+//!
+//! ```rust
+//! use rpq::{RPQ, RPQOptions};
+//! use std::time;
+//!
+//! #[tokio::main]
+//! async fn main() {
+//!     let options = RPQOptions {
+//!        max_priority: 10,
+//!        disk_cache_enabled: false,
+//!        database_path: "/tmp/rpq.db".to_string(),
+//!        lazy_disk_cache: true,
+//!        lazy_disk_write_delay: time::Duration::from_secs(5),
+//!        lazy_disk_cache_batch_size: 10_000,
+//!        buffer_size: 1_000_000,
+//!     };
+//!
+//!     let r = RPQ::<i32>::new(options).await;
+//!     if r.is_err() {
+//!         // handle logic
+//!    }
+//! }
+//! ```
+//!
+//! # Architecture Notes
+//! In many ways, RPQ slighty compromises the performance of a traditional priority queue in order to provide
+//! a variety of features that are useful when absorbing distributed load from many down or upstream services.
+//! It employs a fairly novel techinique that allows it to lazily write and delete items from a disk cache while
+//! still maintaining data in memory. This basically means that a object can be added to the queue and then removed
+//! without the disk commit ever blocking the processes sending or reciving the data. In the case that a batch of data
+//! has already been removed from the queue before it is written to disk, the data is simply discarded. This
+//! dramaically reduces the amount of time spent doing disk commits and allows for much better performance in the
+//! case that you need disk caching and still want to maintain a high peak throughput.
+//!
+//! ```text
+//!                 ┌───────┐
+//!                 │ Item  │
+//!                 └───┬───┘
+//!                     │
+//!                     ▼
+//!              ┌─────────────┐
+//!              │             │
+//!              │   enqueue   │
+//!              │             │
+//!              │             │
+//!              └──────┬──────┘
+//!                     │
+//!                     │
+//!                     │
+//! ┌───────────────┐   │    ┌──────────────┐
+//! │               │   │    │              │      ┌───┐
+//! │   VecDeque    │   │    │  Lazy Disk   │      │   │
+//! │               │◄──┴───►│    Writer    ├─────►│ D │
+//! │               │        │              │      │ i │
+//! └───────┬───────┘        └──────────────┘      │ s │
+//!         │                                      │ k │
+//!         │                                      │   │
+//!         │                                      │ C │
+//!         ▼                                      │ a │
+//! ┌───────────────┐         ┌─────────────┐      │ c │
+//! │               │         │             │      │ h │
+//! │    dequeue    │         │   Lazy Disk ├─────►│ e │
+//! │               ├────────►│    Deleter  │      │   │
+//! │               │         │             │      └───┘
+//! └───────┬───────┘         └─────────────┘
+//!         │
+//!         ▼
+//!      ┌──────┐
+//!      │ Item │
+//!      └──────┘
+//! ```
 use core::time;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -81,7 +94,9 @@ pub mod pq;
 
 const DB: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
 
-/// RPQ implements the priority queue
+/// RPQ hold private items and configuration for the RPQ
+/// You don't need to interact with this struct directly
+/// but instead via the implementations attched to the RPQ struct
 pub struct RPQ<T: Ord + Clone + Send> {
     // options is the configuration for the RPQ
     options: RPQOptions,
@@ -121,8 +136,8 @@ pub struct RPQ<T: Ord + Clone + Send> {
 }
 /// RPQOptions is the configuration for the RPQ
 pub struct RPQOptions {
-    /// bucket_count is the number of buckets in the RPQ
-    pub bucket_count: usize,
+    /// max_priority is the number of buckets in the RPQ
+    pub max_priority: usize,
     /// disk_cache_enabled is a flag to enable or disable the disk cache
     pub disk_cache_enabled: bool,
     /// disk_cache_path is the path to the disk cache
@@ -131,9 +146,9 @@ pub struct RPQOptions {
     pub lazy_disk_cache: bool,
     /// lazy_disk_max_delay is the maximum delay for lazy disk writes
     pub lazy_disk_write_delay: time::Duration,
-    /// lazy_disk_cache_batch_size is the maximum batch size for lazy disk writes
+    /// lazy_disk_cache_batch_size is the batch size for lazy disk writes
     pub lazy_disk_cache_batch_size: usize,
-    /// buffer_size is the size of the buffer for the disk cache
+    /// buffer_size is the size of the channel buffer for the disk cache
     pub buffer_size: usize,
 }
 
@@ -187,7 +202,7 @@ where
         let lazy_disk_cache = options.lazy_disk_cache;
 
         // Create the buckets
-        for i in 0..options.bucket_count {
+        for i in 0..options.max_priority {
             buckets.insert(i, pq::PriorityQueue::new());
         }
 
@@ -299,7 +314,7 @@ where
         mut item: pq::Item<T>,
     ) -> std::result::Result<(), Box<dyn std::error::Error>> {
         // Check if the item priority is greater than the bucket count
-        if item.priority >= self.options.bucket_count {
+        if item.priority >= self.options.max_priority {
             return std::result::Result::Err(Box::<dyn std::error::Error>::from(
                 std::io::Error::new(
                     std::io::ErrorKind::InvalidInput,
@@ -778,7 +793,7 @@ mod tests {
         let message_count = 1_000_000;
 
         let options = RPQOptions {
-            bucket_count: 10,
+            max_priority: 10,
             disk_cache_enabled: false,
             database_path: "/tmp/rpq.redb".to_string(),
             lazy_disk_cache: false,
@@ -841,7 +856,7 @@ mod tests {
 
         // Create the RPQ
         let options = RPQOptions {
-            bucket_count,
+            max_priority: bucket_count,
             disk_cache_enabled: true,
             database_path: "/tmp/rpq.redb".to_string(),
             lazy_disk_cache: true,

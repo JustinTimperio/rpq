@@ -70,7 +70,7 @@ async fn bench(
     disk_cache_enabled: bool,
 ) -> (f64, f64, f64, usize, usize) {
     let options = RPQOptions {
-        bucket_count: bucket_count,
+        max_priority: bucket_count,
         disk_cache_enabled: disk_cache_enabled,
         database_path: "/tmp/rpq.redb".to_string(),
         lazy_disk_cache: lazy_disk_cache,
