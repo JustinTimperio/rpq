@@ -1,6 +1,6 @@
 [package]
 name = "rpq"
-version = "0.1.0"
+version = "0.1.1"
 edition = "2021"
 authors = ["Justin Timperio"]
 description = "A high performance embeddable double priority queue with complex priority ordering guarantees"

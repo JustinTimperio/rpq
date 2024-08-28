@@ -58,10 +58,10 @@ rpq = "0.1.0"
 ```
 
 ### API Reference
-- `RPQ::new(options: RPQOptions) -> (RPQ, usize)` - Creates a new RPQ with the given options and returns the number of restored items.
-  - `enqueue(mut item: Item)` - Enqueues a new item into the RPQ.
-  - `dequeue() -> Option<Item>` - Dequeues the next item from the RPQ.
-  - `prioritize()` - Reprioritizes all items in the RPQ.
+- `RPQ::new(options: RPQOptions) -> Result<(RPQ, usize), Error>` - Creates a new RPQ with the given options and returns the number of restored items.
+  - `enqueue(mut item: Item) -> Result<(), Error>` - Enqueues a new item into the RPQ.
+  - `dequeue() -> Result<Item, Error>` - Dequeues the next item from the RPQ.
+  - `prioritize() -> Result<(usize, usize), Error>` - Prioritizes the items in the RPQ and returns the number of timed out and reprioritized items.
   - `len() -> usize` - Returns the number of items in the RPQ.
   - `active_buckets() -> usize` - Returns the number of active buckets in the RPQ.
   - `unsynced_batches() -> usize` - Returns the number of unsynced batches pending to be commit to disk.

@@ -209,7 +209,7 @@ impl<T: Clone + Send> Item<T> {
     {
         let b = bytes.to_vec();
         if b.is_empty() {
-            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+            return Err(Box::<dyn Error>::from(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Empty byte array",
             )));
@@ -223,7 +223,7 @@ impl<T: Clone + Send> Item<T> {
     {
         let b = serialize(&self).unwrap();
         if b.is_empty() {
-            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
+            return Err(Box::<dyn Error>::from(std::io::Error::new(
                 std::io::ErrorKind::InvalidInput,
                 "Empty byte array",
             )));

@@ -1,3 +1,67 @@
+///! RPQ implements a priority queue that is optimized for high throughput and low latency.
+///!
+///! The RPQ should always be created with the new function like so:
+///!
+///! ```
+///! let options = RPQOptions {
+///!    bucket_count: 10,
+///!    disk_cache_enabled: true,
+///!    database_path: "/path/rpq.db".to_string(),
+///!    lazy_disk_cache: true,
+///!    lazy_disk_write_delay: time::Duration::from_secs(5),
+///!    lazy_disk_cache_batch_size: 10000,
+///!    buffer_size: 1_000_000,
+///! };
+///!
+///! let r = RPQ::new(options).await;
+///! ```
+///!
+///! Architecture Notes:
+///! In many ways, RPQ slighty compromises the performance of a traditional priority queue in order to provide
+///! a variety of features that are useful when absorbing distributed load from many down or upstream services.
+///! It employs a fairly novel techinique that allows us to lazily write and delete items from a disk cache while
+///! still maintaining data in memory. This basically means that a object can be added to the queue and then removed
+///! without the disk commit ever blocking the processes sending or reciving the data. In the case that a batch of data
+///! has already been removed from the queue before it is written to disk, the data is simply discarded. This
+///! dramaically reduces the amount of time spent doing disk commits and allows for much better performance in the
+///! case that you need disk caching and still want to maintain a high peak throughput.
+///!
+///!
+///!                 ┌───────┐
+///!                 │ Item  │
+///!                 └───┬───┘
+///!                     │
+///!                     ▼
+///!              ┌─────────────┐
+///!              │             │
+///!              │   enqueue   │
+///!              │             │
+///!              │             │
+///!              └──────┬──────┘
+///!                     │
+///!                     │
+///!                     │
+///! ┌───────────────┐   │    ┌──────────────┐
+///! │               │   │    │              │      ┌───┐
+///! │   VecDeque    │   │    │  Lazy Disk   │      │   │
+///! │               │◄──┴───►│    Writer    ├─────►│ D │
+///! │               │        │              │      │ i │
+///! └───────┬───────┘        └──────────────┘      │ s │
+///!         │                                      │ k │
+///!         │                                      │   │
+///!         │                                      │ C │
+///!         ▼                                      │ a │
+///! ┌───────────────┐         ┌─────────────┐      │ c │
+///! │               │         │             │      │ h │
+///! │    dequeue    │         │   Lazy Disk ├─────►│ e │
+///! │               ├────────►│    Deleter  │      │   │
+///! │               │         │             │      └───┘
+///! └───────┬───────┘         └─────────────┘
+///!         │
+///!         ▼
+///!      ┌──────┐
+///!      │ Item │
+///!      └──────┘
 use core::time;
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -15,53 +79,9 @@ use tokio::time::interval;
 mod bpq;
 pub mod pq;
 
-/*
+const DB: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
 
-Archtecture Notes:
-
-In many ways, RPQ slighty compromises the performance of a traditional priority queue in order to provide
-a variety of features that are useful when absorbing distributed load from many down or upstream services.
-It employs a fairly novel techinique that allows us to lazily write and delete items from a disk cache while
-still maintaining data in memory. This basically means that a object can be added to the queue and then removed
-without the disk commit ever blocking the processes sending or reciving the data. In the case that a batch of data
-has already been removed from the queue before it is written to disk, the data is simply discarded. This
-dramaically reduces the amount of time spent doing disk commits and allows for a much higher throughput in the
-case that you need disk caching and still want to maintain a high peak throughput.
-
-
-                 ┌───────┐
-                 │ Item  |
-                 └───┬───┘
-                     │
-                     ▼
-              ┌─────────────┐
-              │             │
-              │   enqueue   │
-              │             │
-              │             │
-              └──────┬──────┘
-                     │
-                     │
-                     │
- ┌───────────────┐   │    ┌──────────────┐
- │               │   │    │              │
- │   VecDeque    │   │    │  Lazy Disk   │
- │               │◄──┴───►│    Writer    │
- │               │        │              │
- └───────┬───────┘        └──────────────┘
-         │
-         │
-         │
-         ▼
- ┌───────────────┐         ┌─────────────┐
- │               │         │             │
- │    dequeue    │         │   Lazy Disk │
- │               ├────────►│    Deleter  │
- │               │         │             │
- └───────────────┘         └─────────────┘
-
-*/
-
+/// RPQ implements the priority queue
 pub struct RPQ<T: Ord + Clone + Send> {
     // options is the configuration for the RPQ
     options: RPQOptions,
@@ -99,6 +119,23 @@ pub struct RPQ<T: Ord + Clone + Send> {
     // sync_handles is a map of priorities to sync handles
     sync_handles: Mutex<Vec<JoinHandle<()>>>,
 }
+/// RPQOptions is the configuration for the RPQ
+pub struct RPQOptions {
+    /// bucket_count is the number of buckets in the RPQ
+    pub bucket_count: usize,
+    /// disk_cache_enabled is a flag to enable or disable the disk cache
+    pub disk_cache_enabled: bool,
+    /// disk_cache_path is the path to the disk cache
+    pub database_path: String,
+    /// disk_cache_max_size is the maximum size of the disk cache
+    pub lazy_disk_cache: bool,
+    /// lazy_disk_max_delay is the maximum delay for lazy disk writes
+    pub lazy_disk_write_delay: time::Duration,
+    /// lazy_disk_cache_batch_size is the maximum batch size for lazy disk writes
+    pub lazy_disk_cache_batch_size: usize,
+    /// buffer_size is the size of the buffer for the disk cache
+    pub buffer_size: usize,
+}
 
 struct BatchHandler {
     // synced_batches is a map of priorities to the last synced batch
@@ -114,31 +151,12 @@ struct BatchCounter {
     batch_number: usize,
 }
 
-pub struct RPQOptions {
-    // bucket_count is the number of buckets in the RPQ
-    pub bucket_count: usize,
-    // disk_cache_enabled is a flag to enable or disable the disk cache
-    pub disk_cache_enabled: bool,
-    // disk_cache_path is the path to the disk cache
-    pub database_path: String,
-    // disk_cache_max_size is the maximum size of the disk cache
-    pub lazy_disk_cache: bool,
-    // lazy_disk_max_delay is the maximum delay for lazy disk writes
-    pub lazy_disk_max_delay: time::Duration,
-    // lazy_disk_cache_batch_size is the maximum batch size for lazy disk writes
-    pub lazy_disk_cache_batch_size: usize,
-    // buffer_size is the size of the buffer for the disk cache
-    pub buffer_size: usize,
-}
-
-const DB: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
-
 impl<T: Ord + Clone + Send + Sync> RPQ<T>
 where
     T: Serialize + DeserializeOwned + 'static,
 {
-    // new creates a new RPQ with the given options
-    // It returns the RPQ and the number of items restored from the disk cache
+    /// new creates a new RPQ with the given options
+    /// It returns the RPQ and the number of items restored from the disk cache
     pub async fn new(
         options: RPQOptions,
     ) -> Result<(Arc<RPQ<T>>, usize), Box<dyn std::error::Error>> {
@@ -166,6 +184,7 @@ where
         // Capture some variables
         let path = options.database_path.clone();
         let disk_cache_enabled = options.disk_cache_enabled;
+        let lazy_disk_cache = options.lazy_disk_cache;
 
         // Create the buckets
         for i in 0..options.bucket_count {
@@ -251,26 +270,30 @@ where
             }
             _ = read_txn.close();
 
-            let mut handles = rpq.sync_handles.lock().await;
-            let rpq_clone = Arc::clone(&rpq);
-            handles.push(tokio::spawn(async move {
-                let result = rpq_clone.lazy_disk_writer().await;
-                if result.is_err() {
-                    println!("Error in lazy disk writer: {:?}", result.err().unwrap());
-                }
-            }));
+            if lazy_disk_cache {
+                let mut handles = rpq.sync_handles.lock().await;
+                let rpq_clone = Arc::clone(&rpq);
+                handles.push(tokio::spawn(async move {
+                    let result = rpq_clone.lazy_disk_writer().await;
+                    if result.is_err() {
+                        println!("Error in lazy disk writer: {:?}", result.err().unwrap());
+                    }
+                }));
 
-            let rpq_clone = Arc::clone(&rpq);
-            handles.push(tokio::spawn(async move {
-                let result = rpq_clone.lazy_disk_deleter().await;
-                if result.is_err() {
-                    println!("Error in lazy disk deleter: {:?}", result.err().unwrap());
-                }
-            }));
+                let rpq_clone = Arc::clone(&rpq);
+                handles.push(tokio::spawn(async move {
+                    let result = rpq_clone.lazy_disk_deleter().await;
+                    if result.is_err() {
+                        println!("Error in lazy disk deleter: {:?}", result.err().unwrap());
+                    }
+                }));
+            }
         }
         Ok((rpq, restored_items))
     }
 
+    /// enqueue adds an item to the RPQ
+    /// It returns an error if one occurs otherwise it returns ()
     pub async fn enqueue(
         &self,
         mut item: pq::Item<T>,
@@ -336,6 +359,8 @@ where
         Ok(())
     }
 
+    /// dequeue removes an item from the RPQ
+    /// It returns an error if one occurs otherwise it returns the item
     pub async fn dequeue(&self) -> Result<Option<pq::Item<T>>, Box<dyn std::error::Error>> {
         // Fetch the bucket
         let bucket_id = self.non_empty_buckets.peek();
@@ -391,6 +416,8 @@ where
         Ok(Some(item))
     }
 
+    /// prioritize moves items from the disk cache to the RPQ
+    /// It returns the number of items removed and escalated
     pub async fn prioritize(&self) -> Result<(usize, usize), Box<dyn std::error::Error>> {
         let mut removed: usize = 0;
         let mut escalated: usize = 0;
@@ -412,7 +439,7 @@ where
 
     async fn lazy_disk_writer(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut awaiting_batches = HashMap::<usize, Vec<pq::Item<T>>>::new();
-        let mut ticker = interval(self.options.lazy_disk_max_delay);
+        let mut ticker = interval(self.options.lazy_disk_write_delay);
         let mut receiver = self.lazy_disk_writer_receiver.lock().await;
         let mut shutdown_receiver = self.shutdown_receiver.clone();
 
@@ -421,19 +448,21 @@ where
             tokio::select! {
                 // Flush the cache if the ticker has ticked
                 _ = ticker.tick() => {
+                    let mut batch_handler = self.batch_handler.lock().await;
                     for (id, batch) in awaiting_batches.iter_mut() {
-                        let mut batch_handler = self.batch_handler.lock().await;
 
-                        if *batch_handler.deleted_batches.get(id).unwrap_or(&false) {
-                            batch.clear();
-                        } else {
-                            let result = self.commit_batch(batch);
-                            if result.is_err() {
-                                return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                        if batch.len() >= self.options.lazy_disk_cache_batch_size {
+                            if *batch_handler.deleted_batches.get(id).unwrap_or(&false) {
+                                batch.clear();
+                            } else {
+                                let result = self.commit_batch(batch);
+                                if result.is_err() {
+                                    return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                                }
                             }
+                            batch_handler.synced_batches.insert(*id, true);
+                            batch_handler.deleted_batches.insert(*id, false);
                         }
-                        batch_handler.synced_batches.insert(*id, true);
-                        batch_handler.deleted_batches.insert(*id, false);
                     }
                 },
 
@@ -443,24 +472,6 @@ where
                         let batch_bucket = item.get_batch_id();
                         let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
                         batch.push(item);
-
-                        if batch.len() >= self.options.lazy_disk_cache_batch_size {
-                            let mut shandler = self.batch_handler.lock().await;
-
-                            if *shandler.deleted_batches.get(&batch_bucket).unwrap_or(&false) {
-                                batch.clear();
-                                awaiting_batches.remove(&batch_bucket);
-                            } else {
-                                let result = self.commit_batch(batch);
-                                if result.is_err() {
-                                    return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
-                                }
-                                awaiting_batches.remove(&batch_bucket);
-                            }
-
-                            shandler.synced_batches.insert(batch_bucket, true);
-                            shandler.deleted_batches.insert(batch_bucket, false);
-                        }
                     }
                 },
 
@@ -698,6 +709,7 @@ where
         Ok(())
     }
 
+    /// len returns the number of items in the RPQ
     pub async fn len(&self) -> usize {
         let mut len = 0 as usize;
         for (_, active_bucket) in self.buckets.iter() {
@@ -706,10 +718,12 @@ where
         len
     }
 
+    /// active_buckets returns the number of active buckets in the RPQ
     pub fn active_buckets(&self) -> usize {
         self.non_empty_buckets.len()
     }
 
+    /// unsynced_batches returns the number of unsynced batches in the RPQ
     pub async fn unsynced_batches(&self) -> usize {
         let mut unsynced_batches = 0;
         let batch_handler = self.batch_handler.lock().await;
@@ -726,16 +740,19 @@ where
         unsynced_batches
     }
 
-    pub fn items_in_db(&self) -> u64 {
+    /// items_in_db returns the number of items in the disk cache
+    pub fn items_in_db(&self) -> usize {
         if self.disk_cache.is_none() {
             return 0;
         }
         let read_txn = self.disk_cache.as_ref().unwrap().begin_read().unwrap();
         let table = read_txn.open_table(DB).unwrap();
         let count = table.len().unwrap();
-        count
+        count as usize
     }
 
+    /// close closes the RPQ
+    /// It will wait for all items to be written to the disk cache if enabled
     pub async fn close(&self) {
         self.shutdown_sender.send(true).unwrap();
 
@@ -765,7 +782,7 @@ mod tests {
             disk_cache_enabled: false,
             database_path: "/tmp/rpq.redb".to_string(),
             lazy_disk_cache: false,
-            lazy_disk_max_delay: time::Duration::from_secs(5),
+            lazy_disk_write_delay: time::Duration::from_secs(5),
             lazy_disk_cache_batch_size: 5000,
             buffer_size: 1_000_000,
         };
@@ -809,7 +826,7 @@ mod tests {
     #[tokio::test(flavor = "multi_thread")]
     async fn e2e_test() {
         // Set Message Count
-        let message_count = 500_000 as usize;
+        let message_count = 10_000_000 as usize;
 
         // Set Concurrency
         let send_threads = 4 as usize;
@@ -828,9 +845,9 @@ mod tests {
             disk_cache_enabled: true,
             database_path: "/tmp/rpq.redb".to_string(),
             lazy_disk_cache: true,
-            lazy_disk_max_delay: time::Duration::from_secs(5),
-            lazy_disk_cache_batch_size: 5000,
-            buffer_size: 500_000,
+            lazy_disk_write_delay: time::Duration::from_secs(5),
+            lazy_disk_cache_batch_size: 10000,
+            buffer_size: 1_000_000,
         };
         let r = RPQ::new(options).await;
         if r.is_err() {

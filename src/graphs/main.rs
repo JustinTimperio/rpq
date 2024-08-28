@@ -74,7 +74,7 @@ async fn bench(
         disk_cache_enabled: disk_cache_enabled,
         database_path: "/tmp/rpq.redb".to_string(),
         lazy_disk_cache: lazy_disk_cache,
-        lazy_disk_max_delay: std::time::Duration::from_secs(5),
+        lazy_disk_write_delay: std::time::Duration::from_secs(5),
         lazy_disk_cache_batch_size: 5000,
         buffer_size: 1_000_000,
     };
