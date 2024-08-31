@@ -99,7 +99,7 @@ async fn main() {
         }
     }
 
-    let rpq = Arc::clone(&r.unwrap().0);
+    let (rpq, _) = r.unwrap();
 
     let timer = Instant::now();
     let send_timer = Instant::now();
