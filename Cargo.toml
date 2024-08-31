@@ -1,12 +1,20 @@
 [package]
 name = "rpq"
-version = "0.1.1"
+version = "0.1.2"
 edition = "2021"
 authors = ["Justin Timperio"]
 description = "A high performance embeddable double priority queue with complex priority ordering guarantees"
 license = "MIT"
+license-file = "LICENSE"
 readme = "README.md"
 repository = "https://github.com/JustinTimperio/rpq"
+keywords = [
+    "priority-queue",
+    "double-priority-queue",
+    "priority-queue-library",
+    "rpq",
+]
+exclude = ["graphs", "perf.data", "perf.data.old"]
 
 [lib]
 name = "rpq"
@@ -24,7 +32,7 @@ uuid = { version = "1.10.0", features = ["v4"] }
 
 [[bin]]
 name = "rpq-graphs"
-path = "src/graphs/main.rs"
+path = "graphs/main.rs"
 
 [profile.test]
 inherits = "release"
