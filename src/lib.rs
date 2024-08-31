@@ -101,9 +101,9 @@ pub mod pq;
 
 const DB: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
 
-/// RPQ hold private items and configuration for the RPQ
-/// You don't need to interact with this struct directly
-/// but instead via the implementations attched to the RPQ struct
+/// RPQ hold private items and configuration for the RPQ.
+/// You don't need to interact with the items in this struct directly,
+/// but instead via the implementations attched to the RPQ struct.
 pub struct RPQ<T: Ord + Clone + Send> {
     // options is the configuration for the RPQ
     options: RPQOptions,
@@ -144,19 +144,26 @@ pub struct RPQ<T: Ord + Clone + Send> {
 
 /// RPQOptions is the configuration for the RPQ
 pub struct RPQOptions {
-    /// max_priority is the number of buckets in the RPQ
+    /// Holds the number of priorities(buckets) that this RPQ will accept for this queue.
     pub max_priority: usize,
-    /// disk_cache_enabled is a flag to enable or disable the disk cache
+    /// Enables or disables the disk cache using redb as the backend to store items
     pub disk_cache_enabled: bool,
-    /// disk_cache_path is the path to the disk cache
+    /// Holds the path to where the disk cache database will be persisted
     pub database_path: String,
-    /// disk_cache_max_size is the maximum size of the disk cache
+    /// Enables or disables lazy disk writes and deletes. The speed can be quite variable depending
+    /// on the disk itself and how often you are emptying the queue in combination with the write delay
     pub lazy_disk_cache: bool,
-    /// lazy_disk_max_delay is the maximum delay for lazy disk writes
+    /// Sets the delay between lazy disk writes. This delays items from being commited to the disk cache.
+    /// If you are pulling items off the queue faster than this delay, many times can be skip the write to disk,
+    /// massively increasing the throughput of the queue.
     pub lazy_disk_write_delay: time::Duration,
-    /// lazy_disk_cache_batch_size is the batch size for lazy disk writes
+    /// Sets the number of items that will be written to the disk cache in a single batch. This can be used to
+    /// tune the performance of the disk cache depending on your specific workload.
     pub lazy_disk_cache_batch_size: usize,
-    /// buffer_size is the size of the channel buffer for the disk cache
+    /// Sets the size of the channnel that is used to buffer items before they are written to the disk cache.
+    /// This can block your queue if the thread pulling items off the channel becomes fully saturated. Typically you
+    /// should set this value in proportion to your largest write peaks. I.E. if your peak write is 10,000,000 items per second,
+    /// and your average write is 1,000,000 items per second, you should set this value to 20,000,000 to ensure that no blocking occurs.
     pub buffer_size: usize,
 }
 
@@ -178,8 +185,7 @@ impl<T: Ord + Clone + Send + Sync> RPQ<T>
 where
     T: Serialize + DeserializeOwned + 'static,
 {
-    /// new creates a new RPQ with the given options
-    /// It returns the RPQ and the number of items restored from the disk cache
+    /// Creates a new RPQ with the given options and returns the RPQ and the number of items restored from the disk cache
     pub async fn new(options: RPQOptions) -> Result<(Arc<RPQ<T>>, usize), Box<dyn Error>> {
         // Create base structures
         let mut buckets = HashMap::new();
@@ -313,8 +319,7 @@ where
         Ok((rpq, restored_items))
     }
 
-    /// enqueue adds an item to the RPQ
-    /// It returns an error if one occurs otherwise it returns ()
+    /// Adds an item to the RPQ and returns an error if one occurs otherwise it returns ()
     pub async fn enqueue(&self, mut item: pq::Item<T>) -> Result<(), Box<dyn Error>> {
         // Check if the item priority is greater than the bucket count
         if item.priority >= self.options.max_priority {
@@ -376,8 +381,7 @@ where
         Ok(())
     }
 
-    /// dequeue removes an item from the RPQ
-    /// It returns an error if one occurs otherwise it returns the item
+    /// Returns a Result with the next item in the RPQ or an error if one occurs
     pub async fn dequeue(&self) -> Result<Option<pq::Item<T>>, Box<dyn Error>> {
         // Fetch the bucket
         let bucket_id = self.non_empty_buckets.peek();
@@ -436,8 +440,8 @@ where
         Ok(Some(item))
     }
 
-    /// prioritize moves items from the disk cache to the RPQ
-    /// It returns the number of items removed and escalated
+    /// Prioritize reorders the items in each bucket based on the values spesified in the item.
+    /// It returns a tuple with the number of items removed and the number of items escalated or and error if one occurs.
     pub async fn prioritize(&self) -> Result<(usize, usize), Box<dyn Error>> {
         let mut removed: usize = 0;
         let mut escalated: usize = 0;
@@ -722,7 +726,7 @@ where
         Ok(())
     }
 
-    /// len returns the number of items in the RPQ
+    /// Returns the number of items in the RPQ across all buckets
     pub async fn len(&self) -> usize {
         let mut len = 0 as usize;
         for (_, active_bucket) in self.buckets.iter() {
@@ -731,12 +735,12 @@ where
         len
     }
 
-    /// active_buckets returns the number of active buckets in the RPQ
+    /// Returns the number of active buckets in the RPQ (buckets with items)
     pub fn active_buckets(&self) -> usize {
         self.non_empty_buckets.len()
     }
 
-    /// unsynced_batches returns the number of unsynced batches in the RPQ
+    /// Returns the number of pending batches in the RPQ for both the writer or the deleter
     pub async fn unsynced_batches(&self) -> usize {
         let mut unsynced_batches = 0;
         let batch_handler = self.batch_handler.lock().await;
@@ -753,7 +757,7 @@ where
         unsynced_batches
     }
 
-    /// items_in_db returns the number of items in the disk cache
+    /// Returns the number of items in the disk cache which can be helpful for debugging or monitoring
     pub fn items_in_db(&self) -> usize {
         if self.disk_cache.is_none() {
             return 0;
@@ -764,8 +768,7 @@ where
         count as usize
     }
 
-    /// close closes the RPQ
-    /// It will wait for all items to be written to the disk cache if enabled
+    /// Closes the RPQ and waits for all the async tasks to finish
     pub async fn close(&self) {
         self.shutdown_sender.send(true).unwrap();
 
