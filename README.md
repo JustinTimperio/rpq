@@ -54,7 +54,7 @@ TODO: Publish to crates.io
 
 ```toml
 [dependencies]
-rpq = "0.1.0"
+rpq = "0.1.3"
 ```
 
 ### API Reference
