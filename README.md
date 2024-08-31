@@ -3,7 +3,7 @@
 </p>
 
 <h4 align="center">
-  RPQ is a concurrency safe, embeddable priority queue that can be used in a variety of applications. This project is still in the early stages of development and is my first major Rust project so this lib is currently NOT production ready.
+   RPQ is an extremely fast and flexible priority queue, capable of millions of transactions a second. RPQ supports a complex "Double Priority Queue" which allows for priorities to be distributed across N buckets, with each bucket holding a second priority queue which allows for internal escalation and timeouts of items based on parameters the user can specify during submission combined with how frequently you ask RPQ to prioritize the queue. 
 </h4>
 
 
@@ -71,44 +71,76 @@ rpq = "0.1.0"
 
 #### Example Usage
 ```rust
-// Set the options for the RPQ
-let options = RPQOptions {
-    bucket_count: 10,
-    disk_cache_enabled: false,
-    database_path: "/tmp/rpq.redb".to_string(),
-    lazy_disk_cache: false,
-    lazy_disk_max_delay: std::time::Duration::from_secs(5),
-    lazy_disk_cache_batch_size: 5000,
-    buffer_size: 1_000_000,
-};
+use std::sync::Arc;
+use std::time::{Duration, Instant};
+use rpq::pq::Item;
+use rpq::{RPQOptions, RPQ};
 
-// Create a new RPQ
-let result = RPQ::new(options).await;
-if result.is_err() {
-  // Handle error
-}
-let (rpq, restored_items) = result.unwrap();
+#[tokio::main(flavor = "multi_thread")]
+async fn main() {
+    let message_count = 10_000_000;
 
-// Create a new item
-let item = Item::new(
-    0,
-    "test".to_string(),
-    false,
-    None,
-    false,
-    None,
-);
+    let options = RPQOptions {
+        bucket_count: 10,
+        disk_cache_enabled: false,
+        database_path: "/tmp/rpq.redb".to_string(),
+        lazy_disk_cache: false,
+        lazy_disk_max_delay: Duration::from_secs(5),
+        lazy_disk_cache_batch_size: 5000,
+        buffer_size: 1_000_000,
+    };
 
-// Enqueue the item
-let enqueue_result = rqp.enqueue(item).await;
-if enqueue_result.is_err() {
-  // Handle error
-}
+    let r = RPQ::new(options).await;
+    match r {
+        Ok(_) => {}
+        Err(e) => {
+            println!("Error Creating RPQ: {}", e);
+            return;
+        }
+    }
 
-// Dequeue the item
-let result = rqp.dequeue().await;
-if result.is_err() {
-  // Handle error
+    let rpq = Arc::clone(&r.unwrap().0);
+
+    let timer = Instant::now();
+    let send_timer = Instant::now();
+    for i in 0..message_count {
+        let item = Item::new(
+            i % 10,
+            i,
+            false,
+            None,
+            false,
+            Some(Duration::from_secs(5)),
+        );
+        let result = rpq.enqueue(item).await;
+        if result.is_err() {
+            println!("Error Enqueuing: {}", result.err().unwrap());
+            return;
+        }
+    }
+
+    let send_elapsed = send_timer.elapsed().as_secs_f64();
+
+    let receive_timer = Instant::now();
+    for _i in 0..message_count {
+        let result = rpq.dequeue().await;
+        if result.is_err() {
+            println!("Error Dequeuing: {}", result.err().unwrap());
+            return;
+        }
+    }
+
+    let receive_elapsed = receive_timer.elapsed().as_secs_f64();
+
+    println!(
+        "Time to insert {} messages: {}s",
+        message_count, send_elapsed
+    );
+    println!(
+        "Time to receive {} messages: {}s",
+        message_count, receive_elapsed
+    );
+    println!("Total Time: {}s", timer.elapsed().as_secs_f64());
 }
 ```
 

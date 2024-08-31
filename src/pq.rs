@@ -1,6 +1,7 @@
 use std::error::Error;
 use std::time::Duration;
 use std::{collections::VecDeque, sync::RwLock};
+use std::{io::Error as IoError, io::ErrorKind as IoErrorKind};
 
 use bincode::{deserialize, serialize};
 use chrono::{DateTime, Utc};
@@ -126,8 +127,8 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         }
 
         if was_error {
-            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Box::<dyn Error>::from(IoError::new(
+                IoErrorKind::InvalidInput,
                 "Timeout or escalation rate is too large",
             )));
         }
@@ -233,8 +234,8 @@ impl<T: Clone + Send> Item<T> {
     {
         let b = bytes.to_vec();
         if b.is_empty() {
-            return Err(Box::<dyn Error>::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Box::<dyn Error>::from(IoError::new(
+                IoErrorKind::InvalidInput,
                 "Empty byte array",
             )));
         }
@@ -248,8 +249,8 @@ impl<T: Clone + Send> Item<T> {
     {
         let b = serialize(&self).unwrap();
         if b.is_empty() {
-            return Err(Box::<dyn Error>::from(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
+            return Err(Box::<dyn Error>::from(IoError::new(
+                IoErrorKind::InvalidInput,
                 "Empty byte array",
             )));
         }

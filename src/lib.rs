@@ -1,6 +1,9 @@
 //! # RPQ
 //! RPQ implements a in memory, disk cached priority queue that is optimized for high throughput and low latency
-//! while still maintaining strict ordering guarantees and durability.
+//! while still maintaining strict ordering guarantees and durability. Due to the fact that most operations are done
+//! in constant time O(1) or logarithmic time O(log n), with the exception of the prioritize function which happens
+//! in linear time O(n), all RPQ operations are extremely fast. A single RPQ can handle a few million transactions
+//! a second and can be tuned depending on your work load.
 //!
 //!  # Create a new RPQ
 //! The RPQ should always be created with the new function like so:
@@ -77,6 +80,10 @@
 //! ```
 use core::time;
 use std::collections::HashMap;
+use std::error::Error;
+use std::io::Error as IoError;
+use std::io::ErrorKind;
+use std::result::Result;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -134,6 +141,7 @@ pub struct RPQ<T: Ord + Clone + Send> {
     // sync_handles is a map of priorities to sync handles
     sync_handles: Mutex<Vec<JoinHandle<()>>>,
 }
+
 /// RPQOptions is the configuration for the RPQ
 pub struct RPQOptions {
     /// max_priority is the number of buckets in the RPQ
@@ -172,9 +180,7 @@ where
 {
     /// new creates a new RPQ with the given options
     /// It returns the RPQ and the number of items restored from the disk cache
-    pub async fn new(
-        options: RPQOptions,
-    ) -> Result<(Arc<RPQ<T>>, usize), Box<dyn std::error::Error>> {
+    pub async fn new(options: RPQOptions) -> Result<(Arc<RPQ<T>>, usize), Box<dyn Error>> {
         // Create base structures
         let mut buckets = HashMap::new();
         let items_in_queues = AtomicUsize::new(0);
@@ -250,7 +256,7 @@ where
             let cursor = match table.range::<&str>(..) {
                 Ok(range) => range,
                 Err(e) => {
-                    return Err(Box::<dyn std::error::Error>::from(e));
+                    return Err(Box::<dyn Error>::from(e));
                 }
             };
 
@@ -260,8 +266,8 @@ where
                         let item = pq::Item::from_bytes(value.value());
 
                         if item.is_err() {
-                            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
+                            return Err(Box::<dyn Error>::from(IoError::new(
+                                ErrorKind::InvalidInput,
                                 "Error reading from disk cache",
                             )));
                         }
@@ -271,15 +277,15 @@ where
                         i.set_restored();
                         let result = rpq.enqueue(i).await;
                         if result.is_err() {
-                            return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                                std::io::ErrorKind::InvalidInput,
+                            return Err(Box::<dyn Error>::from(IoError::new(
+                                ErrorKind::InvalidInput,
                                 "Error enqueueing item from the disk cache",
                             )));
                         }
                         restored_items += 1;
                     }
                     Err(e) => {
-                        return Err(Box::<dyn std::error::Error>::from(e));
+                        return Err(Box::<dyn Error>::from(e));
                     }
                 }
             }
@@ -309,18 +315,13 @@ where
 
     /// enqueue adds an item to the RPQ
     /// It returns an error if one occurs otherwise it returns ()
-    pub async fn enqueue(
-        &self,
-        mut item: pq::Item<T>,
-    ) -> std::result::Result<(), Box<dyn std::error::Error>> {
+    pub async fn enqueue(&self, mut item: pq::Item<T>) -> Result<(), Box<dyn Error>> {
         // Check if the item priority is greater than the bucket count
         if item.priority >= self.options.max_priority {
-            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
-                    "Priority is greater than bucket count",
-                ),
-            ));
+            return Result::Err(Box::<dyn Error>::from(IoError::new(
+                ErrorKind::InvalidInput,
+                "Priority is greater than bucket count",
+            )));
         }
         let priority = item.priority;
 
@@ -328,9 +329,10 @@ where
         let bucket = self.buckets.get(&item.priority);
 
         if bucket.is_none() {
-            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "Bucket does not exist"),
-            ));
+            return Result::Err(Box::<dyn Error>::from(IoError::new(
+                ErrorKind::InvalidInput,
+                "Bucket does not exist",
+            )));
         }
 
         // If the disk cache is enabled, send the item to the lazy disk writer
@@ -353,7 +355,7 @@ where
                     match was_sent {
                         Ok(_) => {}
                         Err(e) => {
-                            return Err(Box::<dyn std::error::Error>::from(e));
+                            return Err(Box::<dyn Error>::from(e));
                         }
                     }
                 } else {
@@ -361,7 +363,7 @@ where
                     match result {
                         Ok(_) => {}
                         Err(e) => {
-                            return std::result::Result::Err(e);
+                            return Result::Err(e);
                         }
                     }
                 }
@@ -376,30 +378,33 @@ where
 
     /// dequeue removes an item from the RPQ
     /// It returns an error if one occurs otherwise it returns the item
-    pub async fn dequeue(&self) -> Result<Option<pq::Item<T>>, Box<dyn std::error::Error>> {
+    pub async fn dequeue(&self) -> Result<Option<pq::Item<T>>, Box<dyn Error>> {
         // Fetch the bucket
         let bucket_id = self.non_empty_buckets.peek();
         if bucket_id.is_none() {
-            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "No items in queue"),
-            ));
+            return Result::Err(Box::<dyn Error>::from(IoError::new(
+                ErrorKind::InvalidInput,
+                "No items in queue",
+            )));
         }
         let bucket_id = bucket_id.unwrap();
 
         // Fetch the queue
         let queue = self.buckets.get(&bucket_id);
         if queue.is_none() {
-            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "No items in queue"),
-            ));
+            return Result::Err(Box::<dyn Error>::from(IoError::new(
+                ErrorKind::InvalidInput,
+                "No items in queue",
+            )));
         }
 
         // Fetch the item from the bucket
         let item = queue.unwrap().dequeue();
         if item.is_none() {
-            return std::result::Result::Err(Box::<dyn std::error::Error>::from(
-                std::io::Error::new(std::io::ErrorKind::InvalidInput, "No items in queue"),
-            ));
+            return Result::Err(Box::<dyn Error>::from(IoError::new(
+                ErrorKind::InvalidInput,
+                "No items in queue",
+            )));
         }
         self.items_in_queues.fetch_sub(1, Ordering::SeqCst);
         let item = item.unwrap();
@@ -417,13 +422,13 @@ where
                 match was_sent {
                     Ok(_) => {}
                     Err(e) => {
-                        return std::result::Result::Err(Box::new(e));
+                        return Result::Err(Box::new(e));
                     }
                 }
             } else {
                 let result = self.delete_single(item_clone.get_disk_uuid().unwrap().as_ref());
                 if result.is_err() {
-                    return std::result::Result::Err(result.err().unwrap());
+                    return Result::Err(result.err().unwrap());
                 }
             }
         }
@@ -433,7 +438,7 @@ where
 
     /// prioritize moves items from the disk cache to the RPQ
     /// It returns the number of items removed and escalated
-    pub async fn prioritize(&self) -> Result<(usize, usize), Box<dyn std::error::Error>> {
+    pub async fn prioritize(&self) -> Result<(usize, usize), Box<dyn Error>> {
         let mut removed: usize = 0;
         let mut escalated: usize = 0;
 
@@ -444,7 +449,7 @@ where
                     escalated += e;
                 }
                 Err(err) => {
-                    return Err(Box::<dyn std::error::Error>::from(err));
+                    return Err(Box::<dyn Error>::from(err));
                 }
             }
         }
@@ -452,7 +457,7 @@ where
         Ok((removed, escalated))
     }
 
-    async fn lazy_disk_writer(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn lazy_disk_writer(&self) -> Result<(), Box<dyn Error>> {
         let mut awaiting_batches = HashMap::<usize, Vec<pq::Item<T>>>::new();
         let mut ticker = interval(self.options.lazy_disk_write_delay);
         let mut receiver = self.lazy_disk_writer_receiver.lock().await;
@@ -472,7 +477,7 @@ where
                             } else {
                                 let result = self.commit_batch(batch);
                                 if result.is_err() {
-                                    return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                                    return Err(Box::<dyn Error>::from(result.err().unwrap()));
                                 }
                             }
                             batch_handler.synced_batches.insert(*id, true);
@@ -514,7 +519,7 @@ where
                         batch_handler.deleted_batches.insert(*id, false);
                         let result = self.commit_batch(batch);
                         if result.is_err() {
-                            return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                            return Err(Box::<dyn Error>::from(result.err().unwrap()));
                         }
                     }
                     self.batch_shutdown_sender.send(true).unwrap();
@@ -525,7 +530,7 @@ where
         }
     }
 
-    async fn lazy_disk_deleter(&self) -> Result<(), Box<dyn std::error::Error>> {
+    async fn lazy_disk_deleter(&self) -> Result<(), Box<dyn Error>> {
         let mut awaiting_batches = HashMap::<usize, Vec<pq::Item<T>>>::new();
         let mut restored_items: Vec<pq::Item<T>> = Vec::new();
         let mut receiver = self.lazy_disk_delete_receiver.lock().await;
@@ -543,7 +548,7 @@ where
                             if restored_items.len() >= self.options.lazy_disk_cache_batch_size {
                                 let result = self.delete_batch(&mut restored_items);
                                 if result.is_err() {
-                                    return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                                    return Err(Box::<dyn Error>::from(result.err().unwrap()));
                                 }
                                 restored_items.clear();
                             }
@@ -562,7 +567,7 @@ where
                             if *was_synced {
                                 let result = self.delete_batch(batch);
                                 if result.is_err() {
-                                    return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                                    return Err(Box::<dyn Error>::from(result.err().unwrap()));
                                 }
                                 awaiting_batches.remove(&batch_bucket);
                             } else {
@@ -597,7 +602,7 @@ where
                     if !restored_items.is_empty() {
                         let result = self.delete_batch(&mut restored_items);
                         if result.is_err() {
-                            return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                            return Err(Box::<dyn Error>::from(result.err().unwrap()));
                         }
                         restored_items.clear();
                     }
@@ -607,7 +612,7 @@ where
                         if *was_synced {
                             let result = self.delete_batch(batch);
                             if result.is_err() {
-                                return Err(Box::<dyn std::error::Error>::from(result.err().unwrap()));
+                                return Err(Box::<dyn Error>::from(result.err().unwrap()));
                             }
                         } else {
                             batch.clear();
@@ -622,18 +627,15 @@ where
         }
     }
 
-    fn commit_batch(
-        &self,
-        write_cache: &mut Vec<pq::Item<T>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn commit_batch(&self, write_cache: &mut Vec<pq::Item<T>>) -> Result<(), Box<dyn Error>> {
         let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         for item in write_cache.iter() {
             let mut table = write_txn.open_table(DB).unwrap();
             // Convert to bytes
             let b = item.to_bytes();
             if b.is_err() {
-                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                return Err(Box::<dyn Error>::from(IoError::new(
+                    ErrorKind::InvalidInput,
                     "Error converting item to bytes",
                 )));
             }
@@ -643,8 +645,8 @@ where
 
             let was_written = table.insert(key.as_str(), &b[..]);
             if was_written.is_err() {
-                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                return Err(Box::<dyn Error>::from(IoError::new(
+                    ErrorKind::InvalidInput,
                     "Error writing item to disk cache",
                 )));
             }
@@ -655,18 +657,15 @@ where
         Ok(())
     }
 
-    fn delete_batch(
-        &self,
-        delete_cache: &mut Vec<pq::Item<T>>,
-    ) -> Result<(), Box<dyn std::error::Error>> {
+    fn delete_batch(&self, delete_cache: &mut Vec<pq::Item<T>>) -> Result<(), Box<dyn Error>> {
         let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         for item in delete_cache.iter() {
             let mut table = write_txn.open_table(DB).unwrap();
             let key = item.get_disk_uuid().unwrap();
             let was_deleted = table.remove(key.as_str());
             if was_deleted.is_err() {
-                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                return Err(Box::<dyn Error>::from(IoError::new(
+                    ErrorKind::InvalidInput,
                     "Error deleting item from disk cache",
                 )));
             }
@@ -677,16 +676,15 @@ where
         Ok(())
     }
 
-    fn commit_single(&self, item: pq::Item<T>) -> Result<(), Box<dyn std::error::Error>> {
+    fn commit_single(&self, item: pq::Item<T>) -> Result<(), Box<dyn Error>> {
         let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         {
             let mut table = write_txn.open_table(DB).unwrap();
-            // Convert to bytes
             let b = item.to_bytes();
 
             if b.is_err() {
-                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                return Err(Box::<dyn Error>::from(IoError::new(
+                    ErrorKind::InvalidInput,
                     "Error converting item to bytes",
                 )));
             }
@@ -696,8 +694,8 @@ where
 
             let was_written = table.insert(key.as_str(), &b[..]);
             if was_written.is_err() {
-                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                return Err(Box::<dyn Error>::from(IoError::new(
+                    ErrorKind::InvalidInput,
                     "Error writing item to disk cache",
                 )));
             }
@@ -707,14 +705,14 @@ where
         Ok(())
     }
 
-    fn delete_single(&self, key: &str) -> Result<(), Box<dyn std::error::Error>> {
+    fn delete_single(&self, key: &str) -> Result<(), Box<dyn Error>> {
         let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
         {
             let mut table = write_txn.open_table(DB).unwrap();
             let was_written = table.remove(key);
             if was_written.is_err() {
-                return Err(Box::<dyn std::error::Error>::from(std::io::Error::new(
-                    std::io::ErrorKind::InvalidInput,
+                return Err(Box::<dyn Error>::from(IoError::new(
+                    ErrorKind::InvalidInput,
                     "Error deleting item from disk cache",
                 )));
             }
