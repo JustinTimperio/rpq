@@ -1,6 +1,8 @@
+use std::collections::BTreeSet;
+use std::collections::HashMap;
+use std::collections::VecDeque;
 use std::error::Error;
 use std::time::Duration;
-use std::{collections::VecDeque, sync::RwLock};
 use std::{io::Error as IoError, io::ErrorKind as IoErrorKind};
 
 use bincode::{deserialize, serialize};
@@ -14,62 +16,133 @@ mod ftime;
 /// in a queue. Items are stored in a VecDeque and are prioritized based on metadata provided by the user.
 /// Items can be escalated or timed out based on the should_escalate and can_timeout fields.
 pub struct PriorityQueue<T: Ord + Clone + Send> {
-    items: RwLock<VecDeque<Item<T>>>,
+    items: HashMap<usize, VecDeque<Item<T>>>,
+    active_buckets: BTreeSet<usize>,
     ftime: ftime::CachedTime,
+    len: usize,
 }
 
 impl<T: Ord + Clone + Send> PriorityQueue<T> {
     /// This function creates a new PriorityQueue.
-    pub fn new() -> PriorityQueue<T> {
-        PriorityQueue {
-            items: RwLock::new(VecDeque::new()),
+    pub fn new(buckets: usize) -> PriorityQueue<T> {
+        let mut pq = PriorityQueue {
+            items: HashMap::new(),
+            active_buckets: BTreeSet::new(),
             ftime: ftime::CachedTime::new(Duration::from_millis(50)),
+            len: 0 as usize,
+        };
+
+        for i in 0..buckets {
+            pq.items.insert(i, VecDeque::new());
         }
+
+        pq
     }
 
     /// Returns the number of items in this queue
-    pub fn len(&self) -> usize {
-        self.items.read().unwrap().len()
+    pub fn items_in_queue(&self) -> usize {
+        self.len
+    }
+
+    pub fn active_buckets(&self) -> usize {
+        self.active_buckets.len()
     }
 
     /// Adds an item to the queue at the end of the VecDeque
-    pub fn enqueue(&self, item: Item<T>) {
+    pub fn enqueue(&mut self, item: Item<T>) {
         let mut item = item;
-
         // Set the internal fields
         item.submitted_at = self.ftime.get_time().into();
         item.last_escalation = None;
 
-        // Add the item to the queue
-        self.items.write().unwrap().push_back(item);
+        // Insert the item into the queue
+        let priority = item.priority;
+        self.active_buckets.insert(priority);
+        self.items.get_mut(&priority).unwrap().push_back(item);
+        self.len += 1;
     }
 
     /// Removes and returns the item with the highest priority
-    pub fn dequeue(&self) -> Option<Item<T>> {
-        self.items.write().unwrap().pop_front()
+    pub fn dequeue(&mut self) -> Option<Item<T>> {
+        // This should really only ever loop once if the first pulled bucket is a miss
+        loop {
+            let bucket = self.active_buckets.first();
+            if bucket.is_none() {
+                return None;
+            }
+            let bucket = self.items.get_mut(&bucket.unwrap()).unwrap();
+            let item = bucket.pop_front();
+            if item.is_none() {
+                self.active_buckets.pop_first();
+                continue;
+            }
+            self.len -= 1;
+            return item;
+        }
     }
 
     /// Prioritizes the items in the queue based on the priority, escalation rate, and timeout
     /// Returns a tuple of the number of items removed and the number of items swapped
-    pub fn prioritize(&self) -> Result<(usize, usize), Box<dyn Error>> {
-        let mut items = self.items.write().unwrap();
-        let mut to_remove = Vec::new();
-        let mut to_swap = Vec::new();
-        let mut was_error = false;
+    pub fn prioritize(&mut self) -> Result<(usize, usize), Box<dyn Error>> {
+        let mut removed = 0 as usize;
+        let mut swapped = 0 as usize;
 
-        for (index, item) in items.iter_mut().enumerate() {
-            // Timeout items that have been in the queue for too long
-            if item.can_timeout {
-                if let (Some(timeout), Some(submitted_at)) = (item.timeout, item.submitted_at) {
+        for (_, (_, bucket)) in self.items.iter_mut().enumerate() {
+            let mut to_remove = Vec::new();
+            let mut to_swap = Vec::new();
+            let mut was_error = false;
+
+            for (index, item) in bucket.iter_mut().enumerate() {
+                // Timeout items that have been in the queue for too long
+                if item.can_timeout {
+                    if let (Some(timeout), Some(submitted_at)) = (item.timeout, item.submitted_at) {
+                        let current_time_millis = self.ftime.get_time().timestamp_millis();
+                        let submitted_time_millis = submitted_at.timestamp_millis();
+                        let elapsed_time = current_time_millis - submitted_time_millis;
+
+                        // Downcast u128 to i64 to compare with the timeout
+                        if timeout.as_millis() <= i64::MAX as u128 {
+                            if elapsed_time >= timeout.as_millis() as i64 {
+                                to_remove.push(index);
+                                continue;
+                            }
+                        } else {
+                            was_error = true;
+                        }
+                    }
+                }
+
+                // Escalate items that have been in the queue for too long
+                if item.should_escalate {
                     let current_time_millis = self.ftime.get_time().timestamp_millis();
-                    let submitted_time_millis = submitted_at.timestamp_millis();
-                    let elapsed_time = current_time_millis - submitted_time_millis;
+                    let submitted_time_millis = item.submitted_at.unwrap().timestamp_millis();
+                    let escalation_rate_millis = item.escalation_rate.unwrap().as_millis();
 
                     // Downcast u128 to i64 to compare with the timeout
-                    if timeout.as_millis() <= i64::MAX as u128 {
-                        if elapsed_time >= timeout.as_millis() as i64 {
-                            to_remove.push(index);
-                            continue;
+                    if !item.timeout.unwrap().as_millis() <= i64::MAX as u128 {
+                        // Check if we have ever escalated this item
+                        if item.last_escalation.is_none() {
+                            let elapsed_time = current_time_millis - submitted_time_millis;
+
+                            if elapsed_time > escalation_rate_millis as i64 {
+                                item.last_escalation = Some(self.ftime.get_time());
+                                if index > 0 {
+                                    to_swap.push(index);
+                                }
+                            }
+                        } else {
+                            let last_escalation_time_millis =
+                                item.last_escalation.unwrap().timestamp_millis();
+                            let time_since_last_escalation =
+                                current_time_millis - last_escalation_time_millis;
+
+                            // Check if we need to escalate this item again
+                            if time_since_last_escalation >= escalation_rate_millis as i64 {
+                                item.last_escalation = Some(self.ftime.get_time());
+                                if index > 0 {
+                                    to_swap.push(index);
+                                }
+                            }
                         }
                     } else {
                         was_error = true;
@@ -77,60 +150,23 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
                 }
             }
 
-            // Escalate items that have been in the queue for too long
-            if item.should_escalate {
-                let current_time_millis = self.ftime.get_time().timestamp_millis();
-                let submitted_time_millis = item.submitted_at.unwrap().timestamp_millis();
-                let escalation_rate_millis = item.escalation_rate.unwrap().as_millis();
+            removed += to_remove.len();
+            swapped += to_swap.len();
 
-                // Downcast u128 to i64 to compare with the timeout
-                if !item.timeout.unwrap().as_millis() <= i64::MAX as u128 {
-                    // Check if we have ever escalated this item
-                    if item.last_escalation.is_none() {
-                        let elapsed_time = current_time_millis - submitted_time_millis;
-
-                        if elapsed_time > escalation_rate_millis as i64 {
-                            item.last_escalation = Some(self.ftime.get_time());
-                            if index > 0 {
-                                to_swap.push(index);
-                            }
-                        }
-                    } else {
-                        let last_escalation_time_millis =
-                            item.last_escalation.unwrap().timestamp_millis();
-                        let time_since_last_escalation =
-                            current_time_millis - last_escalation_time_millis;
-
-                        // Check if we need to escalate this item again
-                        if time_since_last_escalation >= escalation_rate_millis as i64 {
-                            item.last_escalation = Some(self.ftime.get_time());
-                            if index > 0 {
-                                to_swap.push(index);
-                            }
-                        }
-                    }
-                } else {
-                    was_error = true;
-                }
+            // Perform removals and swaps
+            for index in to_remove.iter().rev() {
+                bucket.remove(*index);
             }
-        }
+            for index in to_swap {
+                bucket.swap(index, index - 1);
+            }
 
-        let removed = to_remove.len();
-        let swapped = to_swap.len();
-
-        // Perform removals and swaps
-        for index in to_remove.iter().rev() {
-            items.remove(*index);
-        }
-        for index in to_swap {
-            items.swap(index, index - 1);
-        }
-
-        if was_error {
-            return Err(Box::<dyn Error>::from(IoError::new(
-                IoErrorKind::InvalidInput,
-                "Timeout or escalation rate is too large",
-            )));
+            if was_error {
+                return Err(Box::<dyn Error>::from(IoError::new(
+                    IoErrorKind::InvalidInput,
+                    "Timeout or escalation rate is too large",
+                )));
+            }
         }
 
         Ok((removed, swapped))
