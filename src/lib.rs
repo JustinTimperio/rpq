@@ -851,6 +851,59 @@ mod tests {
             let expected_data = v.pop_front().unwrap();
             assert!(item.data == expected_data);
         }
+
+        rpq.close().await;
+        assert_eq!(rpq.len().await, 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn disk_write_test() {
+        let message_count = 500_000;
+
+        let options = RPQOptions {
+            max_priority: 10,
+            disk_cache_enabled: true,
+            database_path: "/tmp/rpq-write.redb".to_string(),
+            lazy_disk_cache: true,
+            lazy_disk_write_delay: time::Duration::from_secs(1),
+            lazy_disk_cache_batch_size: 5_000,
+        };
+
+        let r: Result<(Arc<RPQ<usize>>, usize), Box<dyn Error>> = RPQ::new(options).await;
+        assert!(r.is_ok());
+        let (rpq, _restored_items) = r.unwrap();
+
+        let mut expected_data = HashMap::new();
+        for i in 0..message_count {
+            let item = pq::Item::new(
+                i % 10,
+                i,
+                false,
+                None,
+                false,
+                Some(std::time::Duration::from_secs(5)),
+            );
+            let result = rpq.enqueue(item).await;
+            assert!(result.is_ok());
+            let v = expected_data.entry(i % 10).or_insert(VecDeque::new());
+            v.push_back(i);
+        }
+
+        tokio::time::sleep(time::Duration::from_secs(10)).await;
+        assert!(rpq.len().await == message_count);
+        assert!(rpq.items_in_db() != 0);
+
+        for _i in 0..message_count {
+            let item = rpq.dequeue().await;
+            assert!(item.is_ok());
+            let item = item.unwrap().unwrap();
+            let v = expected_data.get_mut(&item.priority).unwrap();
+            let expected_data = v.pop_front().unwrap();
+            assert!(item.data == expected_data);
+        }
+
+        rpq.close().await;
+        assert_eq!(rpq.len().await, 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]

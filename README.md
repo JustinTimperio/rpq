@@ -74,13 +74,14 @@ rpq = "0.1.3"
 #### Example Usage
 ```rust
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
 use rpq::pq::Item;
 use rpq::{RPQOptions, RPQ};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let message_count = 10_000_000;
+    let message_count = 1_000_000;
 
     let options = RPQOptions {
         bucket_count: 10,
@@ -89,7 +90,6 @@ async fn main() {
         lazy_disk_cache: false,
         lazy_disk_max_delay: Duration::from_secs(5),
         lazy_disk_cache_batch_size: 5000,
-        buffer_size: 1_000_000,
     };
 
     let r = RPQ::new(options).await;
@@ -101,10 +101,8 @@ async fn main() {
         }
     }
 
-    let (rpq, _) = r.unwrap();
+    let (rpq, _restored_items) = r.unwrap();
 
-    let timer = Instant::now();
-    let send_timer = Instant::now();
     for i in 0..message_count {
         let item = Item::new(
             i % 10,
@@ -112,7 +110,7 @@ async fn main() {
             false,
             None,
             false,
-            Some(Duration::from_secs(5)),
+            None,
         );
         let result = rpq.enqueue(item).await;
         if result.is_err() {
@@ -121,9 +119,6 @@ async fn main() {
         }
     }
 
-    let send_elapsed = send_timer.elapsed().as_secs_f64();
-
-    let receive_timer = Instant::now();
     for _i in 0..message_count {
         let result = rpq.dequeue().await;
         if result.is_err() {
@@ -132,17 +127,7 @@ async fn main() {
         }
     }
 
-    let receive_elapsed = receive_timer.elapsed().as_secs_f64();
-
-    println!(
-        "Time to insert {} messages: {}s",
-        message_count, send_elapsed
-    );
-    println!(
-        "Time to receive {} messages: {}s",
-        message_count, receive_elapsed
-    );
-    println!("Total Time: {}s", timer.elapsed().as_secs_f64());
+    rpq.close().await;
 }
 ```
 
