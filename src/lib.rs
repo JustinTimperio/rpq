@@ -21,7 +21,6 @@
 //!        lazy_disk_cache: true,
 //!        lazy_disk_write_delay: time::Duration::from_secs(5),
 //!        lazy_disk_cache_batch_size: 10_000,
-//!        buffer_size: 1_000_000,
 //!     };
 //!
 //!     let r = RPQ::<i32>::new(options).await;
@@ -32,13 +31,13 @@
 //! ```
 //!
 //! # Architecture Notes
-//! In many ways, RPQ slighty compromises the performance of a traditional priority queue in order to provide
+//! In many ways, RPQ slightly compromises the performance of a traditional priority queue in order to provide
 //! a variety of features that are useful when absorbing distributed load from many down or upstream services.
-//! It employs a fairly novel techinique that allows it to lazily write and delete items from a disk cache while
+//! It employs a fairly novel technique that allows it to lazily write and delete items from a disk cache while
 //! still maintaining data in memory. This basically means that a object can be added to the queue and then removed
-//! without the disk commit ever blocking the processes sending or reciving the data. In the case that a batch of data
+//! without the disk commit ever blocking the processes sending or receiving the data. In the case that a batch of data
 //! has already been removed from the queue before it is written to disk, the data is simply discarded. This
-//! dramaically reduces the amount of time spent doing disk commits and allows for much better performance in the
+//! dramatically reduces the amount of time spent doing disk commits and allows for much better performance in the
 //! case that you need disk caching and still want to maintain a high peak throughput.
 //!
 //! ```text
@@ -89,7 +88,7 @@ use std::sync::Arc;
 use redb::{Database, ReadableTableMetadata, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
-use tokio::sync::mpsc::{channel, Receiver, Sender};
+use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
 use tokio::sync::watch;
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
@@ -111,13 +110,13 @@ pub struct RPQ<T: Ord + Clone + Send> {
     disk_cache: Option<Arc<Database>>,
 
     // lazy_disk_channel is the channel for lazy disk writes
-    lazy_disk_writer_sender: Sender<pq::Item<T>>,
+    lazy_disk_writer_sender: UnboundedSender<pq::Item<T>>,
     // lazy_disk_reader is the receiver for lazy disk writes
-    lazy_disk_writer_receiver: Mutex<Receiver<pq::Item<T>>>,
+    lazy_disk_writer_receiver: Mutex<UnboundedReceiver<pq::Item<T>>>,
     // lazy_disk_delete_sender is the sender for lazy disk deletes
-    lazy_disk_delete_sender: Sender<pq::Item<T>>,
+    lazy_disk_delete_sender: UnboundedSender<pq::Item<T>>,
     // lazy_disk_delete_receiver is the receiver for lazy disk deletes
-    lazy_disk_delete_receiver: Mutex<Receiver<pq::Item<T>>>,
+    lazy_disk_delete_receiver: Mutex<UnboundedReceiver<pq::Item<T>>>,
 
     // lazy_disk_sync_handles is a map of priorities to sync handles
     lazy_disk_sync_handles: Mutex<Vec<JoinHandle<()>>>,
@@ -147,18 +146,13 @@ pub struct RPQOptions {
     /// Enables or disables lazy disk writes and deletes. The speed can be quite variable depending
     /// on the disk itself and how often you are emptying the queue in combination with the write delay
     pub lazy_disk_cache: bool,
-    /// Sets the delay between lazy disk writes. This delays items from being commited to the disk cache.
+    /// Sets the delay between lazy disk writes. This delays items from being commit'ed to the disk cache.
     /// If you are pulling items off the queue faster than this delay, many times can be skip the write to disk,
     /// massively increasing the throughput of the queue.
     pub lazy_disk_write_delay: time::Duration,
     /// Sets the number of items that will be written to the disk cache in a single batch. This can be used to
     /// tune the performance of the disk cache depending on your specific workload.
     pub lazy_disk_cache_batch_size: usize,
-    /// Sets the size of the channnel that is used to buffer items before they are written to the disk cache.
-    /// This can block your queue if the thread pulling items off the channel becomes fully saturated. Typically you
-    /// should set this value in proportion to your largest write peaks. I.E. if your peak write is 10,000,000 items per second,
-    /// and your average write is 1,000,000 items per second, you should set this value to 20,000,000 to ensure that no blocking occurs.
-    pub buffer_size: usize,
 }
 
 struct BatchHandler {
@@ -195,10 +189,8 @@ where
         };
 
         // Create the lazy disk sync channel
-        let (lazy_disk_writer_sender, lazy_disk_writer_receiver) =
-            channel(options.buffer_size as usize);
-        let (lazy_disk_delete_sender, lazy_disk_delete_receiver) =
-            channel(options.buffer_size as usize);
+        let (lazy_disk_writer_sender, lazy_disk_writer_receiver) = unbounded_channel();
+        let (lazy_disk_delete_sender, lazy_disk_delete_receiver) = unbounded_channel();
 
         // Capture some variables
         let path = options.database_path.clone();
@@ -282,7 +274,7 @@ where
                 item.set_disk_uuid();
                 if self.options.lazy_disk_cache {
                     let lazy_disk_writer_sender = &self.lazy_disk_writer_sender;
-                    let was_sent = lazy_disk_writer_sender.send(item.clone()).await;
+                    let was_sent = lazy_disk_writer_sender.send(item.clone());
                     match was_sent {
                         Ok(_) => {}
                         Err(e) => {
@@ -306,6 +298,50 @@ where
         Ok(())
     }
 
+    pub async fn enqueue_batch(&self, mut items: Vec<pq::Item<T>>) -> Result<(), Box<dyn Error>> {
+        let mut queue = self.queue.lock().await;
+        for item in items.iter_mut() {
+            // If the disk cache is enabled, send the item to the lazy disk writer
+            if self.options.disk_cache_enabled {
+                // Increment the batch number
+                let mut batch_counter = self.lazy_disk_batch_counter.lock().await;
+                batch_counter.message_counter += 1;
+                if batch_counter.message_counter % self.options.lazy_disk_cache_batch_size == 0 {
+                    batch_counter.batch_number += 1;
+                }
+                let bn = batch_counter.batch_number;
+                drop(batch_counter);
+
+                item.set_batch_id(bn);
+                if !item.was_restored() {
+                    item.set_disk_uuid();
+                    if self.options.lazy_disk_cache {
+                        let lazy_disk_writer_sender = &self.lazy_disk_writer_sender;
+                        let was_sent = lazy_disk_writer_sender.send(item.clone());
+                        match was_sent {
+                            Ok(_) => {}
+                            Err(e) => {
+                                return Err(Box::<dyn Error>::from(e));
+                            }
+                        }
+                    } else {
+                        let result = self.commit_single(item.clone());
+                        match result {
+                            Ok(_) => {}
+                            Err(e) => {
+                                return Err(Box::<dyn Error>::from(e));
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Enqueue the item
+            queue.enqueue(item.clone());
+        }
+        Ok(())
+    }
+
     /// Returns a Result with the next item in the RPQ or an error if one occurs
     pub async fn dequeue(&self) -> Result<Option<pq::Item<T>>, Box<dyn Error>> {
         let item = self.queue.lock().await.dequeue();
@@ -315,10 +351,9 @@ where
         let item = item.unwrap();
 
         if self.options.disk_cache_enabled {
-            let item_clone = item.clone();
             if self.options.lazy_disk_cache {
                 let lazy_disk_delete_sender = &self.lazy_disk_delete_sender;
-                let was_sent = lazy_disk_delete_sender.send(item_clone).await;
+                let was_sent = lazy_disk_delete_sender.send(item.clone());
                 match was_sent {
                     Ok(_) => {}
                     Err(e) => {
@@ -346,7 +381,55 @@ where
         Ok(Some(item))
     }
 
-    /// Prioritize reorders the items in each bucket based on the values spesified in the item.
+    pub async fn dequeue_batch(
+        &self,
+        count: usize,
+    ) -> Result<Option<Vec<pq::Item<T>>>, Box<dyn Error>> {
+        let mut items = Vec::new();
+        let mut queue = self.queue.lock().await;
+        for _ in 0..count {
+            let item = queue.dequeue();
+            if item.is_none() {
+                break;
+            }
+            let item = item.unwrap();
+
+            if self.options.disk_cache_enabled {
+                if self.options.lazy_disk_cache {
+                    let lazy_disk_delete_sender = &self.lazy_disk_delete_sender;
+                    let was_sent = lazy_disk_delete_sender.send(item.clone());
+                    match was_sent {
+                        Ok(_) => {}
+                        Err(e) => {
+                            return Result::Err(Box::new(e));
+                        }
+                    }
+                } else {
+                    let id = match item.get_disk_uuid() {
+                        Some(id) => id,
+                        None => {
+                            return Result::Err(Box::new(IoError::new(
+                                ErrorKind::InvalidInput,
+                                "Error getting disk uuid",
+                            )));
+                        }
+                    };
+
+                    let result = self.delete_single(&id);
+                    if result.is_err() {
+                        return Result::Err(result.err().unwrap());
+                    }
+                }
+            }
+            items.push(item);
+        }
+        if items.is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(items))
+    }
+
+    /// Prioritize reorders the items in each bucket based on the values specified in the item.
     /// It returns a tuple with the number of items removed and the number of items escalated or and error if one occurs.
     pub async fn prioritize(&self) -> Result<(usize, usize), Box<dyn Error>> {
         self.queue.lock().await.prioritize()
@@ -474,7 +557,6 @@ where
         let mut shutdown_receiver = self.lazy_disk_batch_shutdown_receiver.clone();
 
         loop {
-            // Check if the write cache is full or the ticker has ticked
             tokio::select! {
                 item = receiver.recv() => {
                     // Check if the item was restored
@@ -738,8 +820,7 @@ mod tests {
             database_path: "/tmp/rpq-order.redb".to_string(),
             lazy_disk_cache: false,
             lazy_disk_write_delay: time::Duration::from_secs(5),
-            lazy_disk_cache_batch_size: 5000,
-            buffer_size: 1_000_000,
+            lazy_disk_cache_batch_size: 5_000,
         };
 
         let r: Result<(Arc<RPQ<usize>>, usize), Box<dyn Error>> = RPQ::new(options).await;
@@ -773,29 +854,28 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
-    async fn e2e_test() {
+    async fn e2e_no_batch() {
         // Set Message Count
         let message_count = 10_000_250 as usize;
 
         // Set Concurrency
-        let send_threads = 5 as usize;
-        let receive_threads = 5 as usize;
+        let send_threads = 4 as usize;
+        let receive_threads = 4 as usize;
         let bucket_count = 10 as usize;
         let sent_counter = Arc::new(AtomicUsize::new(0));
         let received_counter = Arc::new(AtomicUsize::new(0));
         let removed_counter = Arc::new(AtomicUsize::new(0));
         let total_escalated = Arc::new(AtomicUsize::new(0));
-        let finshed_sending = Arc::new(AtomicBool::new(false));
+        let finished_sending = Arc::new(AtomicBool::new(false));
 
         // Create the RPQ
         let options = RPQOptions {
             max_priority: bucket_count,
             disk_cache_enabled: true,
-            database_path: "/tmp/rpq-e2e.redb".to_string(),
+            database_path: "/tmp/rpq-e2e-nobatch.redb".to_string(),
             lazy_disk_cache: true,
             lazy_disk_write_delay: time::Duration::from_secs(5),
-            lazy_disk_cache_batch_size: 10000,
-            buffer_size: 1_000_000,
+            lazy_disk_cache_batch_size: 10_000,
         };
         let r = RPQ::new(options).await;
         assert!(r.is_ok());
@@ -831,7 +911,6 @@ mod tests {
         // Enqueue items
         println!("Launching {} Send Threads", send_threads);
         let mut send_handles = Vec::new();
-        let send_timer = std::time::Instant::now();
         for _ in 0..send_threads {
             let rpq_clone = Arc::clone(&rpq);
             let sent_clone = Arc::clone(&sent_counter);
@@ -843,7 +922,6 @@ mod tests {
                     }
 
                     let item = pq::Item::new(
-                        //rand::thread_rng().gen_range(0..bucket_count),
                         sent_clone.load(Ordering::SeqCst) % bucket_count,
                         0,
                         false,
@@ -863,19 +941,18 @@ mod tests {
         // Dequeue items
         println!("Launching {} Receive Threads", receive_threads);
         let mut receive_handles = Vec::new();
-        let receive_timer = std::time::Instant::now();
         for _ in 0..receive_threads {
             // Clone all the shared variables
             let rpq_clone = Arc::clone(&rpq);
             let received_clone = Arc::clone(&received_counter);
             let sent_clone = Arc::clone(&sent_counter);
             let removed_clone = Arc::clone(&removed_counter);
-            let finshed_sending_clone = Arc::clone(&finshed_sending);
+            let finished_sending_clone = Arc::clone(&finished_sending);
 
             // Spawn the thread
             receive_handles.push(tokio::spawn(async move {
                 loop {
-                    if finshed_sending_clone.load(Ordering::SeqCst) {
+                    if finished_sending_clone.load(Ordering::SeqCst) {
                         if received_clone.load(Ordering::SeqCst)
                             + removed_clone.load(Ordering::SeqCst)
                             >= sent_clone.load(Ordering::SeqCst) + restored_items
@@ -898,15 +975,14 @@ mod tests {
         for handle in send_handles {
             handle.await.unwrap();
         }
-        let send_time = send_timer.elapsed().as_secs_f64();
 
-        finshed_sending.store(true, Ordering::SeqCst);
+        finished_sending.store(true, Ordering::SeqCst);
         // Wait for receive threads to finish
         for handle in receive_handles {
             handle.await.unwrap();
         }
-        let receive_time = receive_timer.elapsed().as_secs_f64();
         shutdown_sender.send(true).unwrap();
+        println!("Total Time: {}s", total_timer.elapsed().as_secs_f64());
 
         // Close the RPQ
         println!("Waiting for RPQ to close");
@@ -920,12 +996,160 @@ mod tests {
             total_escalated.load(Ordering::SeqCst),
             restored_items
         );
+
+        assert_eq!(rpq.items_in_db(), 0);
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn e2e_batch() {
+        // Set Message Count
+        let message_count = 10_000_250 as usize;
+
+        // Set Concurrency
+        let send_threads = 4 as usize;
+        let receive_threads = 4 as usize;
+        let bucket_count = 10 as usize;
+        let sent_counter = Arc::new(AtomicUsize::new(0));
+        let received_counter = Arc::new(AtomicUsize::new(0));
+        let removed_counter = Arc::new(AtomicUsize::new(0));
+        let total_escalated = Arc::new(AtomicUsize::new(0));
+        let finshed_sending = Arc::new(AtomicBool::new(false));
+
+        // Create the RPQ
+        let options = RPQOptions {
+            max_priority: bucket_count,
+            disk_cache_enabled: true,
+            database_path: "/tmp/rpq-e2e-batch.redb".to_string(),
+            lazy_disk_cache: true,
+            lazy_disk_write_delay: time::Duration::from_secs(5),
+            lazy_disk_cache_batch_size: 10_000,
+        };
+        let r = RPQ::new(options).await;
+        assert!(r.is_ok());
+        let (rpq, restored_items) = r.unwrap();
+
+        // Launch the monitoring thread
+        let rpq_clone = Arc::clone(&rpq);
+        let (shutdown_sender, mut shutdown_receiver) = watch::channel(false);
+        let removed_clone = Arc::clone(&removed_counter);
+        let escalated_clone = Arc::clone(&total_escalated);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_receiver.changed() => {
+                    return;
+                },
+                _ = async {
+                    loop {
+                        tokio::time::sleep(time::Duration::from_secs(10)).await;
+                        let results = rpq_clone.prioritize().await;
+
+                        if !results.is_ok() {
+                            let (removed, escalated) = results.unwrap();
+                            removed_clone.fetch_add(removed, Ordering::SeqCst);
+                            escalated_clone.fetch_add(escalated, Ordering::SeqCst);
+                        }
+                    }
+                } => {}
+            }
+        });
+
+        let total_timer = std::time::Instant::now();
+
+        // Enqueue items
+        println!("Launching {} Batch Send Threads", send_threads);
+        let mut send_handles = Vec::new();
+        for _ in 0..send_threads {
+            let rpq_clone = Arc::clone(&rpq);
+            let sent_clone = Arc::clone(&sent_counter);
+
+            send_handles.push(tokio::spawn(async move {
+                loop {
+                    if sent_clone.load(Ordering::SeqCst) >= message_count {
+                        break;
+                    }
+
+                    let mut batch = Vec::new();
+                    for _ in 0..1000 {
+                        let item = pq::Item::new(
+                            sent_clone.load(Ordering::SeqCst) % bucket_count,
+                            0,
+                            false,
+                            None,
+                            false,
+                            Some(std::time::Duration::from_secs(5)),
+                        );
+
+                        batch.push(item);
+                        sent_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+
+                    let result = rpq_clone.enqueue_batch(batch).await;
+                    assert!(result.is_ok());
+                }
+                println!("Finished Sending");
+            }));
+        }
+
+        // Dequeue items
+        println!("Launching {} Batch Receive Threads", receive_threads);
+        let mut receive_handles = Vec::new();
+        for _ in 0..receive_threads {
+            // Clone all the shared variables
+            let rpq_clone = Arc::clone(&rpq);
+            let received_clone = Arc::clone(&received_counter);
+            let sent_clone = Arc::clone(&sent_counter);
+            let removed_clone = Arc::clone(&removed_counter);
+            let finished_sending_clone = Arc::clone(&finshed_sending);
+
+            // Spawn the thread
+            receive_handles.push(tokio::spawn(async move {
+                loop {
+                    if finished_sending_clone.load(Ordering::SeqCst) {
+                        if received_clone.load(Ordering::SeqCst)
+                            + removed_clone.load(Ordering::SeqCst)
+                            >= sent_clone.load(Ordering::SeqCst) + restored_items
+                        {
+                            break;
+                        }
+                    }
+
+                    let item = rpq_clone.dequeue_batch(1000).await;
+                    assert!(item.is_ok());
+                    let item = item.unwrap();
+                    if item.is_none() {
+                        continue;
+                    }
+                    for _i in item.unwrap() {
+                        received_clone.fetch_add(1, Ordering::SeqCst);
+                    }
+                }
+            }));
+        }
+
+        // Wait for send threads to finish
+        for handle in send_handles {
+            handle.await.unwrap();
+        }
+
+        finshed_sending.store(true, Ordering::SeqCst);
+        // Wait for receive threads to finish
+        for handle in receive_handles {
+            handle.await.unwrap();
+        }
+        shutdown_sender.send(true).unwrap();
+        println!("Total Time: {}s", total_timer.elapsed().as_secs_f64());
         println!(
-            "Send Time: {}s, Receive Time: {}s, Total Time: {}s",
-            send_time,
-            receive_time,
-            total_timer.elapsed().as_secs_f64()
+            "Sent: {}, Received: {}, Removed: {}, Escalated: {} Restored: {}",
+            sent_counter.load(Ordering::SeqCst),
+            received_counter.load(Ordering::SeqCst),
+            removed_counter.load(Ordering::SeqCst),
+            total_escalated.load(Ordering::SeqCst),
+            restored_items
         );
+
+        // Close the RPQ
+        println!("Waiting for RPQ to close");
+        rpq.close().await;
 
         assert_eq!(rpq.items_in_db(), 0);
     }

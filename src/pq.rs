@@ -1,5 +1,4 @@
 use std::collections::BTreeSet;
-use std::collections::HashMap;
 use std::collections::VecDeque;
 use std::error::Error;
 use std::time::Duration;
@@ -16,7 +15,7 @@ mod ftime;
 /// in a queue. Items are stored in a VecDeque and are prioritized based on metadata provided by the user.
 /// Items can be escalated or timed out based on the should_escalate and can_timeout fields.
 pub struct PriorityQueue<T: Ord + Clone + Send> {
-    items: HashMap<usize, VecDeque<Item<T>>>,
+    items: Vec<VecDeque<Item<T>>>,
     active_buckets: BTreeSet<usize>,
     ftime: ftime::CachedTime,
     len: usize,
@@ -26,7 +25,7 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
     /// This function creates a new PriorityQueue.
     pub fn new(buckets: usize) -> PriorityQueue<T> {
         let mut pq = PriorityQueue {
-            items: HashMap::new(),
+            items: Vec::new(),
             active_buckets: BTreeSet::new(),
             ftime: ftime::CachedTime::new(Duration::from_millis(50)),
             len: 0 as usize,
@@ -58,7 +57,7 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         // Insert the item into the queue
         let priority = item.priority;
         self.active_buckets.insert(priority);
-        self.items.get_mut(&priority).unwrap().push_back(item);
+        self.items.get_mut(priority).unwrap().push_back(item);
         self.len += 1;
     }
 
@@ -70,8 +69,7 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
             if bucket.is_none() {
                 return None;
             }
-            let bucket = self.items.get_mut(&bucket.unwrap()).unwrap();
-            let item = bucket.pop_front();
+            let item = self.items.get_mut(*bucket.unwrap()).unwrap().pop_front();
             if item.is_none() {
                 self.active_buckets.pop_first();
                 continue;
@@ -87,7 +85,7 @@ impl<T: Ord + Clone + Send> PriorityQueue<T> {
         let mut removed = 0 as usize;
         let mut swapped = 0 as usize;
 
-        for (_, (_, bucket)) in self.items.iter_mut().enumerate() {
+        for (_, bucket) in self.items.iter_mut().enumerate() {
             let mut to_remove = Vec::new();
             let mut to_swap = Vec::new();
             let mut was_error = false;
