@@ -9,8 +9,9 @@
 //! The RPQ should always be created with the new function like so:
 //!
 //! ```rust
-//! use rpq::{RPQ, RPQOptions};
-//! use std::time;
+//! use rpq::RPQ;
+//! use rpq::schema::RPQOptions;
+//! use chrono::Duration;
 //!
 //! #[tokio::main]
 //! async fn main() {
@@ -19,7 +20,7 @@
 //!        disk_cache_enabled: false,
 //!        database_path: "/tmp/rpq.db".to_string(),
 //!        lazy_disk_cache: true,
-//!        lazy_disk_write_delay: time::Duration::from_secs(5),
+//!        lazy_disk_write_delay: Duration::seconds(5),
 //!        lazy_disk_cache_batch_size: 10_000,
 //!     };
 //!
@@ -77,7 +78,6 @@
 //!      │ Item │
 //!      └──────┘
 //! ```
-use core::time;
 use std::collections::HashMap;
 use std::error::Error;
 use std::io::Error as IoError;
@@ -85,7 +85,6 @@ use std::io::ErrorKind;
 use std::result::Result;
 use std::sync::Arc;
 
-use redb::{Database, ReadableTableMetadata, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 use tokio::sync::mpsc::{unbounded_channel, UnboundedReceiver, UnboundedSender};
@@ -94,29 +93,29 @@ use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 use tokio::time::interval;
 
+mod disk;
 pub mod pq;
-
-const DB: TableDefinition<&str, &[u8]> = TableDefinition::new("rpq");
+pub mod schema;
 
 /// RPQ holds private items and configuration for the RPQ.
-pub struct RPQ<T: Ord + Clone + Send> {
+pub struct RPQ<T: Clone + Send> {
     // options is the configuration for the RPQ
-    options: RPQOptions,
+    options: schema::RPQOptions,
 
     // queue is the main queue that holds the items
     queue: Mutex<pq::PriorityQueue<T>>,
 
     // disk_cache maintains a cache of items that are in the queue
-    disk_cache: Option<Arc<Database>>,
+    disk_cache: Arc<Option<disk::DiskCache<T>>>,
 
     // lazy_disk_channel is the channel for lazy disk writes
-    lazy_disk_writer_sender: UnboundedSender<pq::Item<T>>,
+    lazy_disk_writer_sender: UnboundedSender<schema::Item<T>>,
     // lazy_disk_reader is the receiver for lazy disk writes
-    lazy_disk_writer_receiver: Mutex<UnboundedReceiver<pq::Item<T>>>,
+    lazy_disk_writer_receiver: Mutex<UnboundedReceiver<schema::Item<T>>>,
     // lazy_disk_delete_sender is the sender for lazy disk deletes
-    lazy_disk_delete_sender: UnboundedSender<pq::Item<T>>,
+    lazy_disk_delete_sender: Arc<UnboundedSender<schema::Item<T>>>,
     // lazy_disk_delete_receiver is the receiver for lazy disk deletes
-    lazy_disk_delete_receiver: Mutex<UnboundedReceiver<pq::Item<T>>>,
+    lazy_disk_delete_receiver: Mutex<UnboundedReceiver<schema::Item<T>>>,
 
     // lazy_disk_sync_handles is a map of priorities to sync handles
     lazy_disk_sync_handles: Mutex<Vec<JoinHandle<()>>>,
@@ -135,26 +134,6 @@ pub struct RPQ<T: Ord + Clone + Send> {
     lazy_disk_shutdown_sender: watch::Sender<bool>,
 }
 
-/// RPQOptions is the configuration for the RPQ
-pub struct RPQOptions {
-    /// Holds the number of priorities(buckets) that this RPQ will accept for this queue.
-    pub max_priority: usize,
-    /// Enables or disables the disk cache using redb as the backend to store items
-    pub disk_cache_enabled: bool,
-    /// Holds the path to where the disk cache database will be persisted
-    pub database_path: String,
-    /// Enables or disables lazy disk writes and deletes. The speed can be quite variable depending
-    /// on the disk itself and how often you are emptying the queue in combination with the write delay
-    pub lazy_disk_cache: bool,
-    /// Sets the delay between lazy disk writes. This delays items from being commit'ed to the disk cache.
-    /// If you are pulling items off the queue faster than this delay, many times can be skip the write to disk,
-    /// massively increasing the throughput of the queue.
-    pub lazy_disk_write_delay: time::Duration,
-    /// Sets the number of items that will be written to the disk cache in a single batch. This can be used to
-    /// tune the performance of the disk cache depending on your specific workload.
-    pub lazy_disk_cache_batch_size: usize,
-}
-
 struct BatchHandler {
     // synced_batches is a map of priorities to the last synced batch
     synced_batches: HashMap<usize, bool>,
@@ -169,12 +148,12 @@ struct BatchCounter {
     batch_number: usize,
 }
 
-impl<T: Ord + Clone + Send + Sync> RPQ<T>
+impl<T: Clone + Send + Sync> RPQ<T>
 where
     T: Serialize + DeserializeOwned + 'static,
 {
     /// Creates a new RPQ with the given options and returns the RPQ and the number of items restored from the disk cache
-    pub async fn new(options: RPQOptions) -> Result<(Arc<RPQ<T>>, usize), Box<dyn Error>> {
+    pub async fn new(options: schema::RPQOptions) -> Result<(Arc<RPQ<T>>, usize), Box<dyn Error>> {
         // Create base structures
         let sync_handles = Vec::new();
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -191,6 +170,8 @@ where
         // Create the lazy disk sync channel
         let (lazy_disk_writer_sender, lazy_disk_writer_receiver) = unbounded_channel();
         let (lazy_disk_delete_sender, lazy_disk_delete_receiver) = unbounded_channel();
+        let lazy_disk_delete_sender = Arc::new(lazy_disk_delete_sender);
+        let lazy_disk_delete_sender_clone = Arc::clone(&lazy_disk_delete_sender);
 
         // Capture some variables
         let path = options.database_path.clone();
@@ -199,17 +180,26 @@ where
         let max_priority = options.max_priority;
 
         let disk_cache = if disk_cache_enabled {
-            Some(Arc::new(Database::create(&path)?))
+            Arc::new(Some(disk::DiskCache::new(&path)))
         } else {
-            None
+            Arc::new(None)
         };
+
+        let disk_cache_clone_one = Arc::clone(&disk_cache);
+        let disk_cache_clone_two = Arc::clone(&disk_cache);
 
         // Create the RPQ
         let rpq = RPQ {
             options,
-            queue: Mutex::new(pq::PriorityQueue::new(max_priority)),
+            queue: Mutex::new(pq::PriorityQueue::new(
+                max_priority,
+                disk_cache_enabled,
+                lazy_disk_cache,
+                lazy_disk_delete_sender_clone,
+                disk_cache_clone_one,
+            )),
 
-            disk_cache,
+            disk_cache: disk_cache_clone_two,
 
             lazy_disk_sync_handles: Mutex::new(sync_handles),
             lazy_disk_writer_sender: lazy_disk_writer_sender,
@@ -257,7 +247,7 @@ where
     }
 
     /// Adds an item to the RPQ and returns an error if one occurs otherwise it returns ()
-    pub async fn enqueue(&self, mut item: pq::Item<T>) -> Result<(), Box<dyn Error>> {
+    pub async fn enqueue(&self, mut item: schema::Item<T>) -> Result<(), Box<dyn Error>> {
         // If the disk cache is enabled, send the item to the lazy disk writer
         if self.options.disk_cache_enabled {
             // Increment the batch number
@@ -282,11 +272,22 @@ where
                         }
                     }
                 } else {
-                    let result = self.commit_single(item.clone());
-                    match result {
-                        Ok(_) => {}
-                        Err(e) => {
-                            return Err(Box::<dyn Error>::from(e));
+                    let db = self.disk_cache.as_ref();
+                    match db {
+                        None => {
+                            return Err(Box::<dyn Error>::from(IoError::new(
+                                ErrorKind::InvalidInput,
+                                "Error getting disk cache",
+                            )));
+                        }
+                        Some(db) => {
+                            let result = db.commit_single(item.clone());
+                            match result {
+                                Ok(_) => {}
+                                Err(e) => {
+                                    return Err(Box::<dyn Error>::from(e));
+                                }
+                            }
                         }
                     }
                 }
@@ -298,7 +299,11 @@ where
         Ok(())
     }
 
-    pub async fn enqueue_batch(&self, mut items: Vec<pq::Item<T>>) -> Result<(), Box<dyn Error>> {
+    /// Adds a batch of items to the RPQ and returns an error if one occurs otherwise it returns ()
+    pub async fn enqueue_batch(
+        &self,
+        mut items: Vec<schema::Item<T>>,
+    ) -> Result<(), Box<dyn Error>> {
         let mut queue = self.queue.lock().await;
         for item in items.iter_mut() {
             // If the disk cache is enabled, send the item to the lazy disk writer
@@ -325,11 +330,22 @@ where
                             }
                         }
                     } else {
-                        let result = self.commit_single(item.clone());
-                        match result {
-                            Ok(_) => {}
-                            Err(e) => {
-                                return Err(Box::<dyn Error>::from(e));
+                        let db = self.disk_cache.as_ref();
+                        match db {
+                            None => {
+                                return Err(Box::<dyn Error>::from(IoError::new(
+                                    ErrorKind::InvalidInput,
+                                    "Error getting disk cache",
+                                )));
+                            }
+                            Some(db) => {
+                                let result = db.commit_single(item.clone());
+                                match result {
+                                    Ok(_) => {}
+                                    Err(e) => {
+                                        return Err(Box::<dyn Error>::from(e));
+                                    }
+                                }
                             }
                         }
                     }
@@ -343,7 +359,7 @@ where
     }
 
     /// Returns a Result with the next item in the RPQ or an error if one occurs
-    pub async fn dequeue(&self) -> Result<Option<pq::Item<T>>, Box<dyn Error>> {
+    pub async fn dequeue(&self) -> Result<Option<schema::Item<T>>, Box<dyn Error>> {
         let item = self.queue.lock().await.dequeue();
         if item.is_none() {
             return Ok(None);
@@ -371,9 +387,20 @@ where
                     }
                 };
 
-                let result = self.delete_single(&id);
-                if result.is_err() {
-                    return Result::Err(result.err().unwrap());
+                let db = self.disk_cache.as_ref();
+                match db {
+                    None => {
+                        return Result::Err(Box::new(IoError::new(
+                            ErrorKind::InvalidInput,
+                            "Error getting disk cache",
+                        )));
+                    }
+                    Some(db) => {
+                        let result = db.delete_single(&id);
+                        if result.is_err() {
+                            return Result::Err(result.err().unwrap());
+                        }
+                    }
                 }
             }
         }
@@ -381,10 +408,11 @@ where
         Ok(Some(item))
     }
 
+    /// Returns a Result with a batch of items in the RPQ or an error if one occurs
     pub async fn dequeue_batch(
         &self,
         count: usize,
-    ) -> Result<Option<Vec<pq::Item<T>>>, Box<dyn Error>> {
+    ) -> Result<Option<Vec<schema::Item<T>>>, Box<dyn Error>> {
         let mut items = Vec::new();
         let mut queue = self.queue.lock().await;
         for _ in 0..count {
@@ -415,9 +443,20 @@ where
                         }
                     };
 
-                    let result = self.delete_single(&id);
-                    if result.is_err() {
-                        return Result::Err(result.err().unwrap());
+                    let db = self.disk_cache.as_ref();
+                    match db {
+                        None => {
+                            return Result::Err(Box::new(IoError::new(
+                                ErrorKind::InvalidInput,
+                                "Error getting disk cache",
+                            )));
+                        }
+                        Some(db) => {
+                            let result = db.delete_single(&id);
+                            if result.is_err() {
+                                return Result::Err(result.err().unwrap());
+                            }
+                        }
                     }
                 }
             }
@@ -461,10 +500,12 @@ where
         if self.disk_cache.is_none() {
             return 0;
         }
-        let read_txn = self.disk_cache.as_ref().unwrap().begin_read().unwrap();
-        let table = read_txn.open_table(DB).unwrap();
-        let count = table.len().unwrap();
-        count as usize
+
+        let db = self.disk_cache.as_ref();
+        match db {
+            None => 0,
+            Some(db) => db.items_in_db(),
+        }
     }
 
     /// Closes the RPQ and waits for all the async tasks to finish
@@ -478,8 +519,8 @@ where
     }
 
     async fn lazy_disk_writer(&self) -> Result<(), Box<dyn Error>> {
-        let mut awaiting_batches = HashMap::<usize, Vec<pq::Item<T>>>::new();
-        let mut ticker = interval(self.options.lazy_disk_write_delay);
+        let mut awaiting_batches = HashMap::<usize, Vec<schema::Item<T>>>::new();
+        let mut ticker = interval(self.options.lazy_disk_write_delay.to_std().unwrap());
         let mut receiver = self.lazy_disk_writer_receiver.lock().await;
         let mut shutdown_receiver = self.lazy_disk_shutdown_receiver.clone();
 
@@ -495,11 +536,23 @@ where
                             if *batch_handler.deleted_batches.get(id).unwrap_or(&false) {
                                 batch.clear();
                             } else {
-                                let result = self.commit_batch(batch);
-                                if result.is_err() {
-                                    return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                let db = self.disk_cache.as_ref();
+                                match db {
+                                    None => {
+                                        return Result::Err(Box::new(IoError::new(
+                                            ErrorKind::InvalidInput,
+                                            "Error getting disk cache",
+                                        )));
+                                    }
+                                    Some(db) => {
+                                            let result = db.commit_batch(batch);
+                                            if result.is_err() {
+                                                return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                            }
+                                    }
                                 }
                             }
+
                             batch_handler.synced_batches.insert(*id, true);
                             batch_handler.deleted_batches.insert(*id, false);
                         }
@@ -537,9 +590,21 @@ where
 
                         batch_handler.synced_batches.insert(*id, true);
                         batch_handler.deleted_batches.insert(*id, false);
-                        let result = self.commit_batch(batch);
-                        if result.is_err() {
-                            return Err(Box::<dyn Error>::from(result.err().unwrap()));
+
+                        let db = self.disk_cache.as_ref();
+                        match db {
+                            None => {
+                                return Result::Err(Box::new(IoError::new(
+                                    ErrorKind::InvalidInput,
+                                    "Error getting disk cache",
+                                )));
+                            }
+                            Some(db) => {
+                                    let result = db.commit_batch(batch);
+                                    if result.is_err() {
+                                        return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                    }
+                            }
                         }
                     }
                     self.lazy_disk_batch_shutdown_sender.send(true).unwrap();
@@ -551,8 +616,8 @@ where
     }
 
     async fn lazy_disk_deleter(&self) -> Result<(), Box<dyn Error>> {
-        let mut awaiting_batches = HashMap::<usize, Vec<pq::Item<T>>>::new();
-        let mut restored_items: Vec<pq::Item<T>> = Vec::new();
+        let mut awaiting_batches = HashMap::<usize, Vec<schema::Item<T>>>::new();
+        let mut restored_items: Vec<schema::Item<T>> = Vec::new();
         let mut receiver = self.lazy_disk_delete_receiver.lock().await;
         let mut shutdown_receiver = self.lazy_disk_batch_shutdown_receiver.clone();
 
@@ -565,18 +630,28 @@ where
                             restored_items.push(item);
 
                             if restored_items.len() >= self.options.lazy_disk_cache_batch_size {
-                                let result = self.delete_batch(&mut restored_items);
-                                if result.is_err() {
-                                    return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                let db = self.disk_cache.as_ref();
+                                match db {
+                                    None => {
+                                        return Result::Err(Box::new(IoError::new(
+                                            ErrorKind::InvalidInput,
+                                            "Error getting disk cache",
+                                        )));
+                                    }
+                                    Some(db) => {
+                                            let result = db.delete_batch(&mut restored_items);
+                                            if result.is_err() {
+                                                return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                            }
+                                    }
                                 }
-                                restored_items.clear();
                             }
                             continue;
                         }
 
                         // If the item was not restored, add it to the batch
                         let batch_bucket = item.get_batch_id();
-                        let batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
+                        let mut batch = awaiting_batches.entry(batch_bucket).or_insert(Vec::new());
                         batch.push(item);
 
                         // Check if the batch is full
@@ -584,10 +659,22 @@ where
                             let mut batch_handler = self.lazy_disk_batch_handler.lock().await;
                             let was_synced = batch_handler.synced_batches.get(&batch_bucket).unwrap_or(&false);
                             if *was_synced {
-                                let result = self.delete_batch(batch);
-                                if result.is_err() {
-                                    return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                let db = self.disk_cache.as_ref();
+                                match db {
+                                    None => {
+                                        return Result::Err(Box::new(IoError::new(
+                                            ErrorKind::InvalidInput,
+                                            "Error getting disk cache",
+                                        )));
+                                    }
+                                    Some(db) => {
+                                            let result = db.delete_batch(&mut batch);
+                                            if result.is_err() {
+                                                return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                            }
+                                    }
                                 }
+
                                 awaiting_batches.remove(&batch_bucket);
                             } else {
                                 batch.clear();
@@ -619,19 +706,41 @@ where
 
                     // Commit the remaining batches
                     if !restored_items.is_empty() {
-                        let result = self.delete_batch(&mut restored_items);
-                        if result.is_err() {
-                            return Err(Box::<dyn Error>::from(result.err().unwrap()));
-                        }
+                                let db = self.disk_cache.as_ref();
+                                match db {
+                                    None => {
+                                        return Result::Err(Box::new(IoError::new(
+                                            ErrorKind::InvalidInput,
+                                            "Error getting disk cache",
+                                        )));
+                                    }
+                                    Some(db) => {
+                                            let result = db.delete_batch(&mut restored_items);
+                                            if result.is_err() {
+                                                return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                            }
+                                    }
+                                }
                     }
-                    for (id, batch) in awaiting_batches.iter_mut() {
+                    for (id, mut batch) in awaiting_batches.iter_mut() {
                         let mut batch_handler = self.lazy_disk_batch_handler.lock().await;
                         let was_synced = batch_handler.synced_batches.get(id).unwrap_or(&false);
                         if *was_synced {
-                            let result = self.delete_batch(batch);
-                            if result.is_err() {
-                                return Err(Box::<dyn Error>::from(result.err().unwrap()));
-                            }
+                                let db = self.disk_cache.as_ref();
+                                match db {
+                                    None => {
+                                        return Result::Err(Box::new(IoError::new(
+                                            ErrorKind::InvalidInput,
+                                            "Error getting disk cache",
+                                        )));
+                                    }
+                                    Some(db) => {
+                                            let result = db.delete_batch(&mut batch);
+                                            if result.is_err() {
+                                                return Err(Box::<dyn Error>::from(result.err().unwrap()));
+                                            }
+                                    }
+                                }
                         } else {
                             batch.clear();
                         }
@@ -645,164 +754,39 @@ where
         }
     }
 
-    fn commit_batch(&self, write_cache: &mut Vec<pq::Item<T>>) -> Result<(), Box<dyn Error>> {
-        let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
-        for item in write_cache.iter() {
-            let mut table = write_txn.open_table(DB).unwrap();
-            let b = item.to_bytes();
-            if b.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error converting item to bytes",
-                )));
-            }
-
-            let b = b.unwrap();
-            let key = item.get_disk_uuid().unwrap();
-
-            let was_written = table.insert(key.as_str(), &b[..]);
-            if was_written.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error writing item to disk cache",
-                )));
-            }
-        }
-
-        write_txn.commit().unwrap();
-        write_cache.clear();
-        Ok(())
-    }
-
-    fn delete_batch(&self, delete_cache: &mut Vec<pq::Item<T>>) -> Result<(), Box<dyn Error>> {
-        let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
-        for item in delete_cache.iter() {
-            let mut table = write_txn.open_table(DB).unwrap();
-            let key = item.get_disk_uuid().unwrap();
-            let was_deleted = table.remove(key.as_str());
-            if was_deleted.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error deleting item from disk cache",
-                )));
-            }
-        }
-        write_txn.commit().unwrap();
-
-        delete_cache.clear();
-        Ok(())
-    }
-
-    fn commit_single(&self, item: pq::Item<T>) -> Result<(), Box<dyn Error>> {
-        let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
-        {
-            let mut table = write_txn.open_table(DB).unwrap();
-            let b = item.to_bytes();
-
-            if b.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error converting item to bytes",
-                )));
-            }
-            let b = b.unwrap();
-
-            let disk_uuid = item.get_disk_uuid();
-            if disk_uuid.is_none() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error getting disk uuid",
-                )));
-            }
-
-            let was_written = table.insert(disk_uuid.unwrap().as_str(), &b[..]);
-            if was_written.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error writing item to disk cache",
-                )));
-            }
-        }
-        write_txn.commit().unwrap();
-
-        Ok(())
-    }
-
-    fn delete_single(&self, key: &str) -> Result<(), Box<dyn Error>> {
-        let write_txn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
-        {
-            let mut table = write_txn.open_table(DB).unwrap();
-            let was_removed = table.remove(key);
-            if was_removed.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error deleting item from disk cache",
-                )));
-            }
-        }
-        write_txn.commit().unwrap();
-
-        Ok(())
-    }
-
     async fn restore_from_disk(&self) -> Result<usize, Box<dyn Error>> {
-        let mut restored_items = 0 as usize;
-
-        // Create the initial table
-        let ctxn = self.disk_cache.as_ref().unwrap().begin_write().unwrap();
-        ctxn.open_table(DB).unwrap();
-        ctxn.commit().unwrap();
-
-        let read_txn = self.disk_cache.as_ref().unwrap().begin_read().unwrap();
-        let table = read_txn.open_table(DB).unwrap();
-
-        let cursor = match table.range::<&str>(..) {
-            Ok(range) => range,
-            Err(e) => {
-                return Err(Box::<dyn Error>::from(e));
+        let db = self.disk_cache.as_ref();
+        match db {
+            None => {
+                return Err(Box::<dyn Error>::from(IoError::new(
+                    ErrorKind::InvalidInput,
+                    "Error getting disk cache",
+                )));
             }
-        };
-
-        // Restore the items from the disk cache
-        for (_i, entry) in cursor.enumerate() {
-            match entry {
-                Ok((_key, value)) => {
-                    let item = pq::Item::from_bytes(value.value());
-
-                    if item.is_err() {
-                        return Err(Box::<dyn Error>::from(IoError::new(
-                            ErrorKind::InvalidInput,
-                            "Error reading from disk cache",
-                        )));
-                    }
-
-                    // Mark the item as restored
-                    let mut i = item.unwrap();
-                    i.set_restored();
-                    let result = self.enqueue(i).await;
-                    if result.is_err() {
-                        return Err(Box::<dyn Error>::from(IoError::new(
-                            ErrorKind::InvalidInput,
-                            "Error enqueueing item from the disk cache",
-                        )));
-                    }
-                    restored_items += 1;
+            Some(db) => {
+                let restored_items = db.return_items_from_disk();
+                if restored_items.is_err() {
+                    return Err(Box::<dyn Error>::from(restored_items.err().unwrap()));
                 }
-                Err(e) => {
-                    return Err(Box::<dyn Error>::from(e));
+                let restored_items = restored_items?;
+                let total_items = restored_items.len();
+
+                let mut queue = self.queue.lock().await;
+                for item in restored_items.iter() {
+                    queue.enqueue(item.clone());
                 }
+
+                Ok(total_items)
             }
         }
-        _ = read_txn.close();
-
-        Ok(restored_items)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use core::time;
+    use chrono::Duration;
+    use rand::Rng;
     use std::sync::atomic::Ordering;
     use std::{
         collections::VecDeque,
@@ -814,12 +798,12 @@ mod tests {
     async fn order_test() {
         let message_count = 1_000_000;
 
-        let options = RPQOptions {
+        let options = schema::RPQOptions {
             max_priority: 10,
             disk_cache_enabled: false,
             database_path: "/tmp/rpq-order.redb".to_string(),
             lazy_disk_cache: false,
-            lazy_disk_write_delay: time::Duration::from_secs(5),
+            lazy_disk_write_delay: Duration::seconds(5),
             lazy_disk_cache_batch_size: 5_000,
         };
 
@@ -829,14 +813,7 @@ mod tests {
 
         let mut expected_data = HashMap::new();
         for i in 0..message_count {
-            let item = pq::Item::new(
-                i % 10,
-                i,
-                false,
-                None,
-                false,
-                Some(std::time::Duration::from_secs(5)),
-            );
+            let item = schema::Item::new(i % 10, i, false, None, false, Some(Duration::seconds(5)));
             let result = rpq.enqueue(item).await;
             assert!(result.is_ok());
             let v = expected_data.entry(i % 10).or_insert(VecDeque::new());
@@ -857,15 +834,106 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    async fn prioritize_test() {
+        let message_count = 1_000_000;
+        let sent_counter = Arc::new(AtomicUsize::new(0));
+        let received_counter = Arc::new(AtomicUsize::new(0));
+        let removed_counter = Arc::new(AtomicUsize::new(0));
+        let total_escalated = Arc::new(AtomicUsize::new(0));
+
+        let options = schema::RPQOptions {
+            max_priority: 10,
+            disk_cache_enabled: true,
+            database_path: "/tmp/rpq-prioritize.redb".to_string(),
+            lazy_disk_cache: true,
+            lazy_disk_write_delay: Duration::seconds(5),
+            lazy_disk_cache_batch_size: 5_000,
+        };
+
+        let r: Result<(Arc<RPQ<usize>>, usize), Box<dyn Error>> = RPQ::new(options).await;
+        assert!(r.is_ok());
+        let (rpq, _restored_items) = r.unwrap();
+
+        let rpq_clone = Arc::clone(&rpq);
+        let (shutdown_sender, mut shutdown_receiver) = watch::channel(false);
+        let removed_clone = Arc::clone(&removed_counter);
+        let escalated_clone = Arc::clone(&total_escalated);
+        tokio::spawn(async move {
+            tokio::select! {
+                _ = shutdown_receiver.changed() => {
+                    return;
+                },
+                _ = async {
+                    loop {
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+                        let results = rpq_clone.prioritize().await;
+
+                        if results.is_ok() {
+                            let (removed, escalated) = results.unwrap();
+                            removed_clone.fetch_add(removed, Ordering::SeqCst);
+                            escalated_clone.fetch_add(escalated, Ordering::SeqCst);
+                        } else {
+                            println!("Error: {:?}", results.err().unwrap());
+                        }
+                    }
+                } => {}
+            }
+        });
+
+        for i in 0..message_count {
+            let item = schema::Item::new(
+                i % 10,
+                i,
+                true,
+                Some(Duration::seconds(rand::thread_rng().gen_range(1..10))),
+                true,
+                Some(Duration::seconds(10)),
+            );
+            let result = rpq.enqueue(item).await;
+            assert!(result.is_ok());
+            sent_counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        loop {
+            if removed_counter.load(Ordering::SeqCst) + received_counter.load(Ordering::SeqCst)
+                == sent_counter.load(Ordering::SeqCst)
+            {
+                break;
+            }
+
+            tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
+            let item = rpq.dequeue().await;
+            assert!(item.is_ok());
+            let item = item.unwrap();
+            if item.is_none() {
+                continue;
+            }
+            received_counter.fetch_add(1, Ordering::SeqCst);
+        }
+
+        shutdown_sender.send(true).unwrap();
+        rpq.close().await;
+        assert_eq!(rpq.len().await, 0);
+        assert_eq!(rpq.items_in_db(), 0);
+        println!(
+            "Sent: {}, Received: {}, Removed: {}, Escalated: {}",
+            sent_counter.load(Ordering::SeqCst),
+            received_counter.load(Ordering::SeqCst),
+            removed_counter.load(Ordering::SeqCst),
+            total_escalated.load(Ordering::SeqCst)
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
     async fn disk_write_test() {
         let message_count = 500_000;
 
-        let options = RPQOptions {
+        let options = schema::RPQOptions {
             max_priority: 10,
             disk_cache_enabled: true,
             database_path: "/tmp/rpq-write.redb".to_string(),
             lazy_disk_cache: true,
-            lazy_disk_write_delay: time::Duration::from_secs(1),
+            lazy_disk_write_delay: Duration::seconds(1),
             lazy_disk_cache_batch_size: 5_000,
         };
 
@@ -875,13 +943,13 @@ mod tests {
 
         let mut expected_data = HashMap::new();
         for i in 0..message_count {
-            let item = pq::Item::new(
+            let item = schema::Item::new(
                 i % 10,
                 i,
-                false,
-                None,
-                false,
-                Some(std::time::Duration::from_secs(5)),
+                true,
+                Some(Duration::seconds(1)),
+                true,
+                Some(Duration::seconds(5)),
             );
             let result = rpq.enqueue(item).await;
             assert!(result.is_ok());
@@ -889,7 +957,7 @@ mod tests {
             v.push_back(i);
         }
 
-        tokio::time::sleep(time::Duration::from_secs(10)).await;
+        tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
         assert!(rpq.len().await == message_count);
         assert!(rpq.items_in_db() != 0);
 
@@ -904,6 +972,7 @@ mod tests {
 
         rpq.close().await;
         assert_eq!(rpq.len().await, 0);
+        assert_eq!(rpq.items_in_db(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread")]
@@ -922,12 +991,12 @@ mod tests {
         let finished_sending = Arc::new(AtomicBool::new(false));
 
         // Create the RPQ
-        let options = RPQOptions {
+        let options = schema::RPQOptions {
             max_priority: bucket_count,
             disk_cache_enabled: true,
             database_path: "/tmp/rpq-e2e-nobatch.redb".to_string(),
             lazy_disk_cache: true,
-            lazy_disk_write_delay: time::Duration::from_secs(5),
+            lazy_disk_write_delay: Duration::seconds(5),
             lazy_disk_cache_batch_size: 10_000,
         };
         let r = RPQ::new(options).await;
@@ -946,7 +1015,7 @@ mod tests {
                 },
                 _ = async {
                     loop {
-                        tokio::time::sleep(time::Duration::from_secs(10)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         let results = rpq_clone.prioritize().await;
 
                         if !results.is_ok() {
@@ -974,20 +1043,19 @@ mod tests {
                         break;
                     }
 
-                    let item = pq::Item::new(
+                    let item = schema::Item::new(
                         sent_clone.load(Ordering::SeqCst) % bucket_count,
                         0,
-                        false,
-                        None,
-                        false,
-                        Some(std::time::Duration::from_secs(5)),
+                        true,
+                        Some(Duration::seconds(1)),
+                        true,
+                        Some(Duration::seconds(5)),
                     );
 
                     let result = rpq_clone.enqueue(item).await;
                     assert!(result.is_ok());
                     sent_clone.fetch_add(1, Ordering::SeqCst);
                 }
-                println!("Finished Sending");
             }));
         }
 
@@ -1069,12 +1137,12 @@ mod tests {
         let finshed_sending = Arc::new(AtomicBool::new(false));
 
         // Create the RPQ
-        let options = RPQOptions {
+        let options = schema::RPQOptions {
             max_priority: bucket_count,
             disk_cache_enabled: true,
             database_path: "/tmp/rpq-e2e-batch.redb".to_string(),
             lazy_disk_cache: true,
-            lazy_disk_write_delay: time::Duration::from_secs(5),
+            lazy_disk_write_delay: Duration::seconds(5),
             lazy_disk_cache_batch_size: 10_000,
         };
         let r = RPQ::new(options).await;
@@ -1093,7 +1161,7 @@ mod tests {
                 },
                 _ = async {
                     loop {
-                        tokio::time::sleep(time::Duration::from_secs(10)).await;
+                        tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
                         let results = rpq_clone.prioritize().await;
 
                         if !results.is_ok() {
@@ -1122,14 +1190,14 @@ mod tests {
                     }
 
                     let mut batch = Vec::new();
-                    for _ in 0..1000 {
-                        let item = pq::Item::new(
+                    for i in 0..1000 {
+                        let item = schema::Item::new(
                             sent_clone.load(Ordering::SeqCst) % bucket_count,
-                            0,
-                            false,
-                            None,
-                            false,
-                            Some(std::time::Duration::from_secs(5)),
+                            i,
+                            true,
+                            Some(Duration::seconds(1)),
+                            true,
+                            Some(Duration::seconds(5)),
                         );
 
                         batch.push(item);
