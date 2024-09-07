@@ -1,12 +1,10 @@
-use std::error::Error;
-use std::io::Error as IoError;
-use std::io::ErrorKind;
 use std::vec::Vec;
 
 use redb::{Database, ReadableTableMetadata, TableDefinition};
 use serde::de::DeserializeOwned;
 use serde::Serialize;
 
+use crate::errors::DiskError;
 use crate::schema;
 
 pub struct DiskCache<T: Clone + Send> {
@@ -20,21 +18,26 @@ impl<T: Clone + Send> DiskCache<T>
 where
     T: Serialize + DeserializeOwned,
 {
-    pub fn new(path: &str) -> DiskCache<T> {
-        let db = Database::create(path).unwrap();
+    pub fn new(path: &str) -> Result<DiskCache<T>, DiskError> {
+        let db = Database::create(path);
 
-        // Create the initial table
-        let ctxn = db.begin_write().unwrap();
-        ctxn.open_table(DB).unwrap();
-        ctxn.commit().unwrap();
+        match db {
+            Ok(db) => {
+                // Create the initial table
+                let ctxn = db.begin_write().unwrap();
+                ctxn.open_table(DB).unwrap();
+                ctxn.commit().unwrap();
 
-        DiskCache {
-            db,
-            phantom: std::marker::PhantomData,
+                Ok(DiskCache {
+                    db,
+                    phantom: std::marker::PhantomData,
+                })
+            }
+            Err(e) => Err(DiskError::DatabaseError(e)),
         }
     }
 
-    pub fn commit_batch(&self, write_cache: &mut Vec<schema::Item<T>>) -> Result<(), Box<dyn Error>>
+    pub fn commit_batch(&self, write_cache: &mut Vec<schema::Item<T>>) -> Result<(), DiskError>
     where
         T: Serialize + DeserializeOwned,
     {
@@ -43,10 +46,7 @@ where
             let mut table = write_txn.open_table(DB).unwrap();
             let b = item.to_bytes();
             if b.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error converting item to bytes",
-                )));
+                return Err(DiskError::ItemSerdeError(b.err().unwrap()));
             }
 
             let b = b.unwrap();
@@ -54,10 +54,7 @@ where
 
             let was_written = table.insert(key.as_str(), &b[..]);
             if was_written.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error writing item to disk cache",
-                )));
+                return Err(DiskError::StorageError(was_written.err().unwrap()));
             }
         }
 
@@ -66,10 +63,7 @@ where
         Ok(())
     }
 
-    pub fn delete_batch(
-        &self,
-        delete_cache: &mut Vec<schema::Item<T>>,
-    ) -> Result<(), Box<dyn Error>>
+    pub fn delete_batch(&self, delete_cache: &mut Vec<schema::Item<T>>) -> Result<(), DiskError>
     where
         T: Serialize + DeserializeOwned,
     {
@@ -79,10 +73,7 @@ where
             let key = item.get_disk_uuid().unwrap();
             let was_deleted = table.remove(key.as_str());
             if was_deleted.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error deleting item from disk cache",
-                )));
+                return Err(DiskError::StorageError(was_deleted.err().unwrap()));
             }
         }
         write_txn.commit().unwrap();
@@ -91,7 +82,7 @@ where
         Ok(())
     }
 
-    pub fn commit_single(&self, item: schema::Item<T>) -> Result<(), Box<dyn Error>>
+    pub fn commit_single(&self, item: schema::Item<T>) -> Result<(), DiskError>
     where
         T: Serialize + DeserializeOwned,
     {
@@ -99,29 +90,19 @@ where
         {
             let mut table = write_txn.open_table(DB).unwrap();
             let b = item.to_bytes();
-
             if b.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error converting item to bytes",
-                )));
+                return Err(DiskError::ItemSerdeError(b.err().unwrap()));
             }
-            let b = b.unwrap();
 
             let disk_uuid = item.get_disk_uuid();
             if disk_uuid.is_none() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error getting disk uuid",
-                )));
+                return Err(DiskError::DiskUuidError);
             }
 
+            let b = b.unwrap();
             let was_written = table.insert(disk_uuid.unwrap().as_str(), &b[..]);
             if was_written.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error writing item to disk cache",
-                )));
+                return Err(DiskError::StorageError(was_written.err().unwrap()));
             }
         }
         write_txn.commit().unwrap();
@@ -129,7 +110,7 @@ where
         Ok(())
     }
 
-    pub fn delete_single(&self, key: &str) -> Result<(), Box<dyn Error>>
+    pub fn delete_single(&self, key: &str) -> Result<(), DiskError>
     where
         T: Serialize + DeserializeOwned,
     {
@@ -138,10 +119,7 @@ where
             let mut table = write_txn.open_table(DB).unwrap();
             let was_removed = table.remove(key);
             if was_removed.is_err() {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    ErrorKind::InvalidInput,
-                    "Error deleting item from disk cache",
-                )));
+                return Err(DiskError::StorageError(was_removed.err().unwrap()));
             }
         }
         write_txn.commit().unwrap();
@@ -149,7 +127,7 @@ where
         Ok(())
     }
 
-    pub fn return_items_from_disk(&self) -> Result<Vec<schema::Item<T>>, Box<dyn Error>>
+    pub fn return_items_from_disk(&self) -> Result<Vec<schema::Item<T>>, DiskError>
     where
         T: Serialize + DeserializeOwned,
     {
@@ -159,9 +137,7 @@ where
 
         let cursor = match table.range::<&str>(..) {
             Ok(range) => range,
-            Err(e) => {
-                return Err(Box::<dyn Error>::from(e));
-            }
+            Err(e) => return Err(DiskError::StorageError(e)),
         };
 
         // Restore the items from the disk cache
@@ -169,13 +145,8 @@ where
             match entry {
                 Ok((_key, value)) => {
                     let item = schema::Item::from_bytes(value.value());
-
                     if item.is_err() {
-                        println!("Error reading from disk cache: {:?}", item.err());
-                        return Err(Box::<dyn Error>::from(IoError::new(
-                            ErrorKind::InvalidInput,
-                            "Error reading from disk cache",
-                        )));
+                        return Err(DiskError::ItemSerdeError(item.err().unwrap()));
                     }
 
                     // Mark the item as restored
@@ -184,7 +155,7 @@ where
                     items.push(i);
                 }
                 Err(e) => {
-                    return Err(Box::<dyn Error>::from(e));
+                    return Err(DiskError::StorageError(e));
                 }
             }
         }

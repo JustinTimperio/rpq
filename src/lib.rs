@@ -14,12 +14,12 @@
 //!
 //! #[tokio::main(flavor = "multi_thread")]
 //! async fn main() {
-//!     let message_count = 1_000;
+//!     let message_count = 100_000;
 //!
 //!     let options = RPQOptions {
 //!         max_priority: 10,
 //!         disk_cache_enabled: true,
-//!         database_path: "/tmp/rpq-prioritize.redb".to_string(),
+//!         database_path: "/tmp/rpq.redb".to_string(),
 //!         lazy_disk_cache: true,
 //!         lazy_disk_write_delay: Duration::seconds(5),
 //!         lazy_disk_cache_batch_size: 10_000,
@@ -113,9 +113,6 @@
 //!      └──────┘
 //! ```
 use std::collections::HashMap;
-use std::error::Error;
-use std::io::Error as IoError;
-use std::io::ErrorKind;
 use std::result::Result;
 use std::sync::Arc;
 
@@ -128,6 +125,7 @@ use tokio::task::JoinHandle;
 use tokio::time::interval;
 
 mod disk;
+pub mod errors;
 pub mod pq;
 pub mod schema;
 
@@ -187,7 +185,9 @@ where
     T: Serialize + DeserializeOwned + 'static,
 {
     /// Creates a new RPQ with the given options and returns the RPQ and the number of items restored from the disk cache
-    pub async fn new(options: schema::RPQOptions) -> Result<(Arc<RPQ<T>>, usize), Box<dyn Error>> {
+    pub async fn new(
+        options: schema::RPQOptions,
+    ) -> Result<(Arc<RPQ<T>>, usize), errors::RPQError> {
         // Create base structures
         let sync_handles = Vec::new();
         let (shutdown_sender, shutdown_receiver) = watch::channel(false);
@@ -214,7 +214,11 @@ where
         let max_priority = options.max_priority;
 
         let disk_cache = if disk_cache_enabled {
-            Arc::new(Some(disk::DiskCache::new(&path)))
+            let result = disk::DiskCache::new(&path);
+            if result.is_err() {
+                return Err(errors::RPQError::DiskError(result.err().unwrap()));
+            }
+            Arc::new(Some(result.unwrap()))
         } else {
             Arc::new(None)
         };
@@ -254,9 +258,9 @@ where
         if disk_cache_enabled {
             let result = rpq.restore_from_disk().await;
             if result.is_err() {
-                return Err(result.err().unwrap());
+                return Err(errors::RPQError::DiskError(result.err().unwrap()));
             }
-            restored_items = result?;
+            restored_items = result.unwrap();
 
             if lazy_disk_cache {
                 let mut handles = rpq.lazy_disk_sync_handles.lock().await;
@@ -281,7 +285,7 @@ where
     }
 
     /// Adds an item to the RPQ and returns an error if one occurs otherwise it returns ()
-    pub async fn enqueue(&self, mut item: schema::Item<T>) -> Result<(), Box<dyn Error>> {
+    pub async fn enqueue(&self, mut item: schema::Item<T>) -> Result<(), errors::RPQError> {
         // If the disk cache is enabled, send the item to the lazy disk writer
         if self.options.disk_cache_enabled {
             // Increment the batch number
@@ -301,25 +305,24 @@ where
                     let was_sent = lazy_disk_writer_sender.send(item.clone());
                     match was_sent {
                         Ok(_) => {}
-                        Err(e) => {
-                            return Err(Box::<dyn Error>::from(e));
+                        Err(_) => {
+                            return Err(errors::RPQError::ChannelSendError);
                         }
                     }
                 } else {
                     let db = self.disk_cache.as_ref();
                     match db {
                         None => {
-                            return Err(Box::<dyn Error>::from(IoError::new(
-                                ErrorKind::InvalidInput,
-                                "Error getting disk cache",
-                            )));
+                            return Err(errors::RPQError::DiskError(
+                                errors::DiskError::DiskCacheNotInitialized,
+                            ));
                         }
                         Some(db) => {
                             let result = db.commit_single(item.clone());
                             match result {
                                 Ok(_) => {}
                                 Err(e) => {
-                                    return Err(e);
+                                    return Err(errors::RPQError::DiskError(e));
                                 }
                             }
                         }
@@ -337,7 +340,7 @@ where
     pub async fn enqueue_batch(
         &self,
         mut items: Vec<schema::Item<T>>,
-    ) -> Result<(), Box<dyn Error>> {
+    ) -> Result<(), errors::RPQError> {
         let mut queue = self.queue.lock().await;
         for item in items.iter_mut() {
             // If the disk cache is enabled, send the item to the lazy disk writer
@@ -359,25 +362,24 @@ where
                         let was_sent = lazy_disk_writer_sender.send(item.clone());
                         match was_sent {
                             Ok(_) => {}
-                            Err(e) => {
-                                return Err(Box::<dyn Error>::from(e));
+                            Err(_) => {
+                                return Err(errors::RPQError::ChannelSendError);
                             }
                         }
                     } else {
                         let db = self.disk_cache.as_ref();
                         match db {
                             None => {
-                                return Err(Box::<dyn Error>::from(IoError::new(
-                                    ErrorKind::InvalidInput,
-                                    "Error getting disk cache",
-                                )));
+                                return Err(errors::RPQError::DiskError(
+                                    errors::DiskError::DiskCacheNotInitialized,
+                                ));
                             }
                             Some(db) => {
                                 let result = db.commit_single(item.clone());
                                 match result {
                                     Ok(_) => {}
                                     Err(e) => {
-                                        return Err(e);
+                                        return Err(errors::RPQError::DiskError(e));
                                     }
                                 }
                             }
@@ -393,7 +395,7 @@ where
     }
 
     /// Returns a Result with the next item in the RPQ or an error if one occurs
-    pub async fn dequeue(&self) -> Result<Option<schema::Item<T>>, Box<dyn Error>> {
+    pub async fn dequeue(&self) -> Result<Option<schema::Item<T>>, errors::RPQError> {
         let item = self.queue.lock().await.dequeue();
         if item.is_none() {
             return Ok(None);
@@ -406,33 +408,31 @@ where
                 let was_sent = lazy_disk_delete_sender.send(item.clone());
                 match was_sent {
                     Ok(_) => {}
-                    Err(e) => {
-                        return Result::Err(Box::new(e));
+                    Err(_) => {
+                        return Err(errors::RPQError::ChannelSendError);
                     }
                 }
             } else {
                 let id = match item.get_disk_uuid() {
                     Some(id) => id,
                     None => {
-                        return Result::Err(Box::new(IoError::new(
-                            ErrorKind::InvalidInput,
-                            "Error getting disk uuid",
-                        )));
+                        return Err(errors::RPQError::DiskError(
+                            errors::DiskError::DiskUuidError,
+                        ));
                     }
                 };
 
                 let db = self.disk_cache.as_ref();
                 match db {
                     None => {
-                        return Result::Err(Box::new(IoError::new(
-                            ErrorKind::InvalidInput,
-                            "Error getting disk cache",
-                        )));
+                        return Err(errors::RPQError::DiskError(
+                            errors::DiskError::DiskCacheNotInitialized,
+                        ));
                     }
                     Some(db) => {
                         let result = db.delete_single(&id);
                         if result.is_err() {
-                            return Result::Err(result.err().unwrap());
+                            return Err(errors::RPQError::DiskError(result.err().unwrap()));
                         }
                     }
                 }
@@ -446,7 +446,7 @@ where
     pub async fn dequeue_batch(
         &self,
         count: usize,
-    ) -> Result<Option<Vec<schema::Item<T>>>, Box<dyn Error>> {
+    ) -> Result<Option<Vec<schema::Item<T>>>, errors::RPQError> {
         let mut items = Vec::new();
         let mut queue = self.queue.lock().await;
         for _ in 0..count {
@@ -462,33 +462,31 @@ where
                     let was_sent = lazy_disk_delete_sender.send(item.clone());
                     match was_sent {
                         Ok(_) => {}
-                        Err(e) => {
-                            return Result::Err(Box::new(e));
+                        Err(_) => {
+                            return Err(errors::RPQError::ChannelSendError);
                         }
                     }
                 } else {
                     let id = match item.get_disk_uuid() {
                         Some(id) => id,
                         None => {
-                            return Result::Err(Box::new(IoError::new(
-                                ErrorKind::InvalidInput,
-                                "Error getting disk uuid",
-                            )));
+                            return Err(errors::RPQError::DiskError(
+                                errors::DiskError::DiskUuidError,
+                            ));
                         }
                     };
 
                     let db = self.disk_cache.as_ref();
                     match db {
                         None => {
-                            return Result::Err(Box::new(IoError::new(
-                                ErrorKind::InvalidInput,
-                                "Error getting disk cache",
-                            )));
+                            return Err(errors::RPQError::DiskError(
+                                errors::DiskError::DiskCacheNotInitialized,
+                            ));
                         }
                         Some(db) => {
                             let result = db.delete_single(&id);
                             if result.is_err() {
-                                return Result::Err(result.err().unwrap());
+                                return Err(errors::RPQError::DiskError(result.err().unwrap()));
                             }
                         }
                     }
@@ -504,7 +502,7 @@ where
 
     /// Prioritize reorders the items in each bucket based on the values specified in the item.
     /// It returns a tuple with the number of items removed and the number of items escalated or and error if one occurs.
-    pub async fn prioritize(&self) -> Result<(usize, usize), Box<dyn Error>> {
+    pub async fn prioritize(&self) -> (usize, usize) {
         self.queue.lock().await.prioritize()
     }
 
@@ -552,7 +550,7 @@ where
         }
     }
 
-    async fn lazy_disk_writer(&self) -> Result<(), Box<dyn Error>> {
+    async fn lazy_disk_writer(&self) -> Result<(), errors::RPQError> {
         let mut awaiting_batches = HashMap::<usize, Vec<schema::Item<T>>>::new();
         let mut ticker = interval(self.options.lazy_disk_write_delay.to_std().unwrap());
         let mut receiver = self.lazy_disk_writer_receiver.lock().await;
@@ -573,15 +571,12 @@ where
                                 let db = self.disk_cache.as_ref();
                                 match db {
                                     None => {
-                                        return Result::Err(Box::new(IoError::new(
-                                            ErrorKind::InvalidInput,
-                                            "Error getting disk cache",
-                                        )));
+                                        return Err(errors::RPQError::DiskError(errors::DiskError::DiskCacheNotInitialized));
                                     }
                                     Some(db) => {
                                             let result = db.commit_batch(batch);
                                             if result.is_err() {
-                                                return Err(result.err().unwrap());
+                                                return Err(errors::RPQError::DiskError(result.err().unwrap()));
                                             }
                                     }
                                 }
@@ -628,15 +623,12 @@ where
                         let db = self.disk_cache.as_ref();
                         match db {
                             None => {
-                                return Result::Err(Box::new(IoError::new(
-                                    ErrorKind::InvalidInput,
-                                    "Error getting disk cache",
-                                )));
+                                return Err(errors::RPQError::DiskError(errors::DiskError::DiskCacheNotInitialized));
                             }
                             Some(db) => {
                                     let result = db.commit_batch(batch);
                                     if result.is_err() {
-                                        return Err(result.err().unwrap());
+                                        return Err(errors::RPQError::DiskError(result.err().unwrap()));
                                     }
                             }
                         }
@@ -649,7 +641,7 @@ where
         }
     }
 
-    async fn lazy_disk_deleter(&self) -> Result<(), Box<dyn Error>> {
+    async fn lazy_disk_deleter(&self) -> Result<(), errors::RPQError> {
         let mut awaiting_batches = HashMap::<usize, Vec<schema::Item<T>>>::new();
         let mut restored_items: Vec<schema::Item<T>> = Vec::new();
         let mut receiver = self.lazy_disk_delete_receiver.lock().await;
@@ -667,15 +659,12 @@ where
                                 let db = self.disk_cache.as_ref();
                                 match db {
                                     None => {
-                                        return Result::Err(Box::new(IoError::new(
-                                            ErrorKind::InvalidInput,
-                                            "Error getting disk cache",
-                                        )));
+                                        return Err(errors::RPQError::DiskError(errors::DiskError::DiskCacheNotInitialized));
                                     }
                                     Some(db) => {
                                             let result = db.delete_batch(&mut restored_items);
                                             if result.is_err() {
-                                                return Err(result.err().unwrap());
+                                                return Err(errors::RPQError::DiskError(result.err().unwrap()));
                                             }
                                     }
                                 }
@@ -696,15 +685,12 @@ where
                                 let db = self.disk_cache.as_ref();
                                 match db {
                                     None => {
-                                        return Result::Err(Box::new(IoError::new(
-                                            ErrorKind::InvalidInput,
-                                            "Error getting disk cache",
-                                        )));
+                                        return Err(errors::RPQError::DiskError(errors::DiskError::DiskCacheNotInitialized));
                                     }
                                     Some(db) => {
                                             let result = db.delete_batch(batch);
                                             if result.is_err() {
-                                                return Err(result.err().unwrap());
+                                                return Err(errors::RPQError::DiskError(result.err().unwrap()));
                                             }
                                     }
                                 }
@@ -743,15 +729,12 @@ where
                                 let db = self.disk_cache.as_ref();
                                 match db {
                                     None => {
-                                        return Result::Err(Box::new(IoError::new(
-                                            ErrorKind::InvalidInput,
-                                            "Error getting disk cache",
-                                        )));
+                                        return Err(errors::RPQError::DiskError(errors::DiskError::DiskCacheNotInitialized));
                                     }
                                     Some(db) => {
                                             let result = db.delete_batch(&mut restored_items);
                                             if result.is_err() {
-                                                return Err(result.err().unwrap());
+                                                return Err(errors::RPQError::DiskError(result.err().unwrap()));
                                             }
                                     }
                                 }
@@ -763,15 +746,12 @@ where
                                 let db = self.disk_cache.as_ref();
                                 match db {
                                     None => {
-                                        return Result::Err(Box::new(IoError::new(
-                                            ErrorKind::InvalidInput,
-                                            "Error getting disk cache",
-                                        )));
+                                        return Err(errors::RPQError::DiskError(errors::DiskError::DiskCacheNotInitialized));
                                     }
                                     Some(db) => {
                                             let result = db.delete_batch(batch);
                                             if result.is_err() {
-                                                return Err(result.err().unwrap());
+                                                return Err(errors::RPQError::DiskError(result.err().unwrap()));
                                             }
                                     }
                                 }
@@ -788,13 +768,10 @@ where
         }
     }
 
-    async fn restore_from_disk(&self) -> Result<usize, Box<dyn Error>> {
+    async fn restore_from_disk(&self) -> Result<usize, errors::DiskError> {
         let db = self.disk_cache.as_ref();
         match db {
-            None => Err(Box::<dyn Error>::from(IoError::new(
-                ErrorKind::InvalidInput,
-                "Error getting disk cache",
-            ))),
+            None => Err(errors::DiskError::DiskCacheNotInitialized),
             Some(db) => {
                 let restored_items = db.return_items_from_disk();
                 if restored_items.is_err() {
@@ -818,11 +795,11 @@ where
 mod tests {
     use super::*;
     use chrono::Duration;
+    use errors::RPQError;
     use rand::Rng;
     use std::sync::atomic::Ordering;
     use std::{
         collections::VecDeque,
-        error::Error,
         sync::atomic::{AtomicBool, AtomicUsize},
     };
 
@@ -839,7 +816,7 @@ mod tests {
             lazy_disk_cache_batch_size: 5_000,
         };
 
-        let r: Result<(Arc<RPQ<usize>>, usize), Box<dyn Error>> = RPQ::new(options).await;
+        let r: Result<(Arc<RPQ<usize>>, usize), RPQError> = RPQ::new(options).await;
         assert!(r.is_ok());
         let (rpq, _restored_items) = r.unwrap();
 
@@ -882,7 +859,7 @@ mod tests {
             lazy_disk_cache_batch_size: 5_000,
         };
 
-        let r: Result<(Arc<RPQ<usize>>, usize), Box<dyn Error>> = RPQ::new(options).await;
+        let r: Result<(Arc<RPQ<usize>>, usize), errors::RPQError> = RPQ::new(options).await;
         assert!(r.is_ok());
         let (rpq, _restored_items) = r.unwrap();
 
@@ -897,15 +874,9 @@ mod tests {
                 _ = async {
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        let results = rpq_clone.prioritize().await;
-
-                        if results.is_ok() {
-                            let (removed, escalated) = results.unwrap();
-                            removed_clone.fetch_add(removed, Ordering::SeqCst);
-                            escalated_clone.fetch_add(escalated, Ordering::SeqCst);
-                        } else {
-                            println!("Error: {:?}", results.err().unwrap());
-                        }
+                        let (removed, escalated) = rpq_clone.prioritize().await;
+                        removed_clone.fetch_add(removed, Ordering::SeqCst);
+                        escalated_clone.fetch_add(escalated, Ordering::SeqCst);
                     }
                 } => {}
             }
@@ -968,7 +939,7 @@ mod tests {
             lazy_disk_cache_batch_size: 5_000,
         };
 
-        let r: Result<(Arc<RPQ<usize>>, usize), Box<dyn Error>> = RPQ::new(options).await;
+        let r: Result<(Arc<RPQ<usize>>, usize), RPQError> = RPQ::new(options).await;
         assert!(r.is_ok());
         let (rpq, _restored_items) = r.unwrap();
 
@@ -1046,13 +1017,9 @@ mod tests {
                 _ = async {
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        let results = rpq_clone.prioritize().await;
-
-                        if results.is_err() {
-                            let (removed, escalated) = results.unwrap();
-                            removed_clone.fetch_add(removed, Ordering::SeqCst);
-                            escalated_clone.fetch_add(escalated, Ordering::SeqCst);
-                        }
+                        let (removed, escalated) = rpq_clone.prioritize().await;
+                        removed_clone.fetch_add(removed, Ordering::SeqCst);
+                        escalated_clone.fetch_add(escalated, Ordering::SeqCst);
                     }
                 } => {}
             }
@@ -1190,13 +1157,9 @@ mod tests {
                 _ = async {
                     loop {
                         tokio::time::sleep(tokio::time::Duration::from_secs(1)).await;
-                        let results = rpq_clone.prioritize().await;
-
-                        if results.is_err() {
-                            let (removed, escalated) = results.unwrap();
-                            removed_clone.fetch_add(removed, Ordering::SeqCst);
-                            escalated_clone.fetch_add(escalated, Ordering::SeqCst);
-                        }
+                        let (removed, escalated) = rpq_clone.prioritize().await;
+                        removed_clone.fetch_add(removed, Ordering::SeqCst);
+                        escalated_clone.fetch_add(escalated, Ordering::SeqCst);
                     }
                 } => {}
             }

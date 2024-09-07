@@ -1,12 +1,10 @@
-use std::error::Error;
-use std::io::Error as IoError;
-use std::io::ErrorKind as IoErrorKind;
-
 use bincode::{deserialize, serialize};
 use chrono::{DateTime, Duration, Utc};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
 use serde_with::{serde_as, DurationMilliSeconds};
+
+use crate::errors::ItemError;
 
 /// RPQOptions is the configuration for the RPQ
 pub struct RPQOptions {
@@ -127,47 +125,35 @@ impl<T: Clone + Send> Item<T> {
     }
 
     /// This function is for internal use only. It returns creates a new Item from a serialized byte array.
-    pub fn from_bytes(bytes: &[u8]) -> Result<Item<T>, Box<dyn Error>>
+    pub fn from_bytes(bytes: &[u8]) -> Result<Item<T>, ItemError>
     where
         T: Serialize + DeserializeOwned,
     {
         let b = bytes.to_vec();
         if b.is_empty() {
-            return Err(Box::<dyn Error>::from(IoError::new(
-                IoErrorKind::InvalidInput,
-                "Empty byte array",
-            )));
+            return Err(ItemError::EmptyByteArray);
         }
 
         let d = deserialize(&b);
         if let Err(e) = d {
-            return Err(Box::<dyn Error>::from(IoError::new(
-                IoErrorKind::InvalidInput,
-                format!("Failed to deserialize item: {}", e),
-            )));
+            return Err(ItemError::ItemSerdeError(e));
         }
 
         Ok(d.unwrap())
     }
 
     /// This function is for internal use only. It returns a serialized byte array from an Item.
-    pub fn to_bytes(&self) -> Result<Vec<u8>, Box<dyn Error>>
+    pub fn to_bytes(&self) -> Result<Vec<u8>, ItemError>
     where
         T: Serialize + DeserializeOwned,
     {
         let b = serialize(&self);
         if b.is_err() {
-            return Err(Box::<dyn Error>::from(IoError::new(
-                IoErrorKind::InvalidInput,
-                "Failed to serialize item",
-            )));
+            return Err(ItemError::ItemSerdeError(b.err().unwrap()));
         }
         let b = b.unwrap();
         if b.is_empty() {
-            return Err(Box::<dyn Error>::from(IoError::new(
-                IoErrorKind::InvalidInput,
-                "Output empty byte array",
-            )));
+            return Err(ItemError::EmptyByteArray);
         }
 
         Ok(b)

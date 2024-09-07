@@ -99,13 +99,9 @@ async fn bench(
                 _ = async {
                     loop {
                         tokio::time::sleep(std::time::Duration::from_secs(1)).await;
-                        let results = rpq_clone.prioritize().await;
-
-                        if !results.is_err() {
-                            let (r, e) = results.unwrap();
-                            removed_clone.fetch_add(r, Ordering::SeqCst);
-                            escalated_clone.fetch_add(e, Ordering::SeqCst);
-                        }
+                        let (r, e) = rpq_clone.prioritize().await;
+                        removed_clone.fetch_add(r, Ordering::SeqCst);
+                        escalated_clone.fetch_add(e, Ordering::SeqCst);
                     }
                 } => {}
             }

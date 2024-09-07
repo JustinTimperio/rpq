@@ -1,6 +1,5 @@
 use std::collections::BTreeSet;
 use std::collections::VecDeque;
-use std::error::Error;
 use std::time::Duration as StdDuration;
 use std::{sync::Arc, vec::Vec};
 
@@ -94,7 +93,7 @@ impl<T: Clone + Send> PriorityQueue<T> {
 
     /// Prioritizes the items in the queue based on the priority, escalation rate, and timeout
     /// Returns a tuple of the number of items removed and the number of items swapped
-    pub fn prioritize(&mut self) -> Result<(usize, usize), Box<dyn Error>>
+    pub fn prioritize(&mut self) -> (usize, usize)
     where
         T: Serialize + DeserializeOwned,
     {
@@ -195,6 +194,6 @@ impl<T: Clone + Send> PriorityQueue<T> {
             }
         }
 
-        Ok((removed, swapped))
+        (removed, swapped)
     }
 }
