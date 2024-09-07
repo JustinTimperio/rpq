@@ -1,6 +1,6 @@
 [package]
 name = "rpq"
-version = "0.1.3"
+version = "0.2.0"
 edition = "2021"
 authors = ["Justin Timperio"]
 description = "A high performance embeddable double priority queue with complex priority ordering guarantees"
@@ -25,6 +25,7 @@ csv = "1.3.0"
 rand = "0.8.4"
 redb = "2.1.1"
 serde = { version = "1.0.208", features = ["derive"] }
+serde_with = { version = "3.9.0", features = ["chrono"] }
 tokio = { version = "1.10.0", features = ["full"] }
 uuid = { version = "1.10.0", features = ["v4"] }
 
@@ -33,3 +34,4 @@ inherits = "release"
 
 [workspace]
 members = ["graphs"]
+name = "rpq-graphs"

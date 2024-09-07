@@ -42,10 +42,10 @@ RPQ is a concurrency safe, embeddable priority queue that can be used in a varie
 ## Benchmarks
 Due to the fact that most operations are done in constant time O(1) or logarithmic time O(log n), with the exception of the prioritize function which happens in linear time O(n), all RPQ operations are extremely fast. A single RPQ can handle a few million transactions a second and can be tuned depending on your work load. I have included some basic benchmarks using C++, Rust, Zig, and Go to measure RPQ's performance against the standard implementations of other languages that can be found here at: [pq-bench](https://github.com/JustinTimperio/pq-bench). 
 
-|                                                                                                             |                                                                                                 |
-|-------------------------------------------------------------------------------------------------------------|-------------------------------------------------------------------------------------------------|
-| ![Time-Spent](https://github.com/JustinTimperio/pq-bench/blob/master/docs/Time-Spent-vs-Implementation.png) | ![Queue-Speed-WITHOUT-Reprioritize](./docs/Queue-Speed-Without-Prioritize.png)                  |
-| ![TODO: Queue-Speed-WITH-Reprioritize](./docs/Queue-Speed-With-Prioritize.png)                              | ![Time-to-Send-and-Recive-VS-Bucket-Count](./docs/Time-to-Send-and-Receive-VS-Bucket-Count.png) |
+|                                                                                                             |                                                                                                  |
+|-------------------------------------------------------------------------------------------------------------|--------------------------------------------------------------------------------------------------|
+| ![Time-Spent](https://github.com/JustinTimperio/pq-bench/blob/master/docs/Time-Spent-vs-Implementation.png) | ![Queue-Speed-WITHOUT-Reprioritize](./docs/Queue-Speed-Without-Prioritize.png)                   |
+| ![TODO: Queue-Speed-WITH-Reprioritize](./docs/Queue-Speed-With-Prioritize.png)                              | ![Time-to-Send-and-Receive-VS-Bucket-Count](./docs/Time-to-Send-and-Receive-VS-Bucket-Count.png) |
 
 ## Usage
 RPQ is a embeddable priority queue that is meant to be used at the core of critical workloads where complex ordering are required in combination with large volumes of data. The best way to us RPQ is to import the Crate and use the API to interact with the queue.
@@ -54,13 +54,15 @@ TODO: Publish to crates.io
 
 ```toml
 [dependencies]
-rpq = "0.1.3"
+rpq = "0.2.0"
 ```
 
 ### API Reference
 - `RPQ::new(options: RPQOptions) -> Result<(RPQ, usize), Error>` - Creates a new RPQ with the given options and returns the number of restored items.
   - `enqueue(mut item: Item) -> Result<(), Error>` - Enqueues a new item into the RPQ.
+  - `enqueue_batch(mut items: Vec<Item>) -> Result<(), Error>` - Enqueues a batch of items into the RPQ.
   - `dequeue() -> Result<Item, Error>` - Dequeues the next item from the RPQ.
+  - `dequeue_batch(count: usize) -> Result<Vec<Item>, Error>` - Dequeues a batch of items from the RPQ.
   - `prioritize() -> Result<(usize, usize), Error>` - Prioritizes the items in the RPQ and returns the number of timed out and reprioritized items.
   - `len() -> usize` - Returns the number of items in the RPQ.
   - `active_buckets() -> usize` - Returns the number of active buckets in the RPQ.
@@ -71,23 +73,20 @@ rpq = "0.1.3"
 
 #### Example Usage
 ```rust
-use std::sync::Arc;
-use std::time::{Duration, Instant};
-use rpq::pq::Item;
-use rpq::{RPQOptions, RPQ};
+use chrono::Duration;
+use rpq::{schema::RPQOptions, schema::Item, RPQ};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
-    let message_count = 10_000_000;
+    let message_count = 1_000_000;
 
     let options = RPQOptions {
-        bucket_count: 10,
-        disk_cache_enabled: false,
-        database_path: "/tmp/rpq.redb".to_string(),
-        lazy_disk_cache: false,
-        lazy_disk_max_delay: Duration::from_secs(5),
-        lazy_disk_cache_batch_size: 5000,
-        buffer_size: 1_000_000,
+        max_priority: 10,
+        disk_cache_enabled: true,
+        database_path: "/tmp/rpq-prioritize.redb".to_string(),
+        lazy_disk_cache: true,
+        lazy_disk_write_delay: Duration::seconds(5),
+        lazy_disk_cache_batch_size: 10_000,
     };
 
     let r = RPQ::new(options).await;
@@ -99,10 +98,8 @@ async fn main() {
         }
     }
 
-    let (rpq, _) = r.unwrap();
+    let (rpq, _restored_items) = r.unwrap();
 
-    let timer = Instant::now();
-    let send_timer = Instant::now();
     for i in 0..message_count {
         let item = Item::new(
             i % 10,
@@ -110,7 +107,7 @@ async fn main() {
             false,
             None,
             false,
-            Some(Duration::from_secs(5)),
+            None,
         );
         let result = rpq.enqueue(item).await;
         if result.is_err() {
@@ -119,9 +116,6 @@ async fn main() {
         }
     }
 
-    let send_elapsed = send_timer.elapsed().as_secs_f64();
-
-    let receive_timer = Instant::now();
     for _i in 0..message_count {
         let result = rpq.dequeue().await;
         if result.is_err() {
@@ -130,17 +124,7 @@ async fn main() {
         }
     }
 
-    let receive_elapsed = receive_timer.elapsed().as_secs_f64();
-
-    println!(
-        "Time to insert {} messages: {}s",
-        message_count, send_elapsed
-    );
-    println!(
-        "Time to receive {} messages: {}s",
-        message_count, receive_elapsed
-    );
-    println!("Total Time: {}s", timer.elapsed().as_secs_f64());
+    rpq.close().await;
 }
 ```
 
