@@ -34,6 +34,6 @@ impl CachedTime {
     }
 
     pub fn get_time(&self) -> DateTime<Utc> {
-        self.time.read().unwrap().clone()
+        *self.time.read().unwrap()
     }
 }

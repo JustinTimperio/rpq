@@ -64,7 +64,7 @@ rpq = "0.2.0"
   - `dequeue() -> Result<Item, Error>` - Dequeues the next item from the RPQ.
   - `dequeue_batch(count: usize) -> Result<Vec<Item>, Error>` - Dequeues a batch of items from the RPQ.
   - `prioritize() -> Result<(usize, usize), Error>` - Prioritizes the items in the RPQ and returns the number of timed out and reprioritized items.
-  - `len() -> usize` - Returns the number of items in the RPQ.
+  - `items_in_queue() -> usize` - Returns the number of items in the RPQ.
   - `active_buckets() -> usize` - Returns the number of active buckets in the RPQ.
   - `unsynced_batches() -> usize` - Returns the number of unsynced batches pending to be commit to disk.
   - `items_in_db() -> usize` - Returns the number of items in the RPQ database.
@@ -83,7 +83,7 @@ async fn main() {
     let options = RPQOptions {
         max_priority: 10,
         disk_cache_enabled: true,
-        database_path: "/tmp/rpq-prioritize.redb".to_string(),
+        database_path: "/tmp/rpq.redb".to_string(),
         lazy_disk_cache: true,
         lazy_disk_write_delay: Duration::seconds(5),
         lazy_disk_cache_batch_size: 10_000,

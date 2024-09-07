@@ -140,14 +140,11 @@ impl<T: Clone + Send> Item<T> {
         }
 
         let d = deserialize(&b);
-        match d {
-            Err(e) => {
-                return Err(Box::<dyn Error>::from(IoError::new(
-                    IoErrorKind::InvalidInput,
-                    format!("Failed to deserialize item: {}", e),
-                )));
-            }
-            _ => {}
+        if let Err(e) = d {
+            return Err(Box::<dyn Error>::from(IoError::new(
+                IoErrorKind::InvalidInput,
+                format!("Failed to deserialize item: {}", e),
+            )));
         }
 
         Ok(d.unwrap())

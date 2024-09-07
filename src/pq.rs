@@ -39,7 +39,7 @@ impl<T: Clone + Send> PriorityQueue<T> {
             items: Vec::new(),
             active_buckets: BTreeSet::new(),
             ftime: ftime::CachedTime::new(StdDuration::from_millis(50)),
-            len: 0 as usize,
+            len: 0_usize,
             disk_enabled,
             lazy_disk_enabled,
             lazy_disk_deleter,
@@ -81,9 +81,7 @@ impl<T: Clone + Send> PriorityQueue<T> {
         // This should really only ever loop once if the first pulled bucket is a miss
         loop {
             let bucket = self.active_buckets.first();
-            if bucket.is_none() {
-                return None;
-            }
+            bucket?;
             let item = self.items.get_mut(*bucket.unwrap()).unwrap().pop_front();
             if item.is_none() {
                 self.active_buckets.pop_first();
@@ -100,10 +98,10 @@ impl<T: Clone + Send> PriorityQueue<T> {
     where
         T: Serialize + DeserializeOwned,
     {
-        let mut removed = 0 as usize;
-        let mut swapped = 0 as usize;
+        let mut removed = 0_usize;
+        let mut swapped = 0_usize;
 
-        for (_, bucket) in self.items.iter_mut().enumerate() {
+        for bucket in self.items.iter_mut() {
             bucket.retain(|item| {
                 let mut keep = true;
 
@@ -140,54 +138,56 @@ impl<T: Clone + Send> PriorityQueue<T> {
             });
 
             let mut index = 0;
-            let mut last_item_was_escalated = false;
-            let mut last_last_was_escalated = false;
+            let mut last_pos_was_escalated = false;
 
             while index < bucket.len() {
                 let item = bucket.get_mut(index).unwrap();
 
-                if item.should_escalate {
-                    if item.submitted_at.is_some() && item.escalation_rate.is_some() {
-                        let current_time = self.ftime.get_time();
-                        let context = (!last_item_was_escalated && !last_last_was_escalated)
-                            || (last_item_was_escalated && !last_last_was_escalated);
+                if item.should_escalate
+                    && item.submitted_at.is_some()
+                    && item.escalation_rate.is_some()
+                {
+                    let current_time = self.ftime.get_time();
 
-                        // Check if we have ever escalated this item
-                        if item.last_escalation.is_none() {
-                            let elapsed_time = current_time - item.submitted_at.unwrap();
+                    // Check if we have ever escalated this item
+                    if item.last_escalation.is_none() {
+                        let elapsed_time = current_time - item.submitted_at.unwrap();
 
-                            if elapsed_time >= item.escalation_rate.unwrap() {
-                                if context {
-                                    item.last_escalation = Some(self.ftime.get_time());
-                                    if index > 0 {
-                                        bucket.swap(index, index - 1);
-                                    }
-                                    last_last_was_escalated = last_item_was_escalated;
-                                    last_item_was_escalated = true;
-                                    swapped += 1;
+                        if elapsed_time >= item.escalation_rate.unwrap() {
+                            if !last_pos_was_escalated {
+                                item.last_escalation = Some(self.ftime.get_time());
+                                if index > 0 {
+                                    bucket.swap(index, index - 1);
                                 }
-                            } else {
-                                last_last_was_escalated = last_item_was_escalated;
-                                last_item_was_escalated = false;
+                                swapped += 1;
                             }
-
-                        // We have escalated this item before
+                            // We don't need to update last_pos_was_escalated here because we just swapped
+                            // the current cursor index with cursor index - 1. The previous index must have
+                            // not been escalated so we don't need to update last_pos_was_escalated
                         } else {
-                            let elapsed_time = current_time - item.last_escalation.unwrap();
-                            if elapsed_time >= item.escalation_rate.unwrap() {
-                                if context {
-                                    item.last_escalation = Some(self.ftime.get_time());
-                                    if index > 0 {
-                                        bucket.swap(index, index - 1);
-                                    }
-                                    last_last_was_escalated = last_item_was_escalated;
-                                    last_item_was_escalated = true;
-                                    swapped += 1;
+                            // Here we need to update last_pos_was_escalated because we didn't escalate allowing
+                            // for other items to be pushed up past it
+                            last_pos_was_escalated = false;
+                        }
+
+                    // We have escalated this item before
+                    } else {
+                        let elapsed_time = current_time - item.last_escalation.unwrap();
+                        if elapsed_time >= item.escalation_rate.unwrap() {
+                            if !last_pos_was_escalated {
+                                item.last_escalation = Some(self.ftime.get_time());
+                                if index > 0 {
+                                    bucket.swap(index, index - 1);
                                 }
-                            } else {
-                                last_last_was_escalated = last_item_was_escalated;
-                                last_item_was_escalated = false;
+                                swapped += 1;
                             }
+                            // We don't need to update last_pos_was_escalated here because we just swapped
+                            // the current cursor index with cursor index - 1. The previous index must have
+                            // not been escalated so we don't need to update last_pos_was_escalated
+                        } else {
+                            // Here we need to update last_pos_was_escalated because we didn't escalate allowing
+                            // for other items to be pushed up past it
+                            last_pos_was_escalated = false;
                         }
                     }
                 }

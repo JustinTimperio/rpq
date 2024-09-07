@@ -165,7 +165,7 @@ where
         };
 
         // Restore the items from the disk cache
-        for (_i, entry) in cursor.enumerate() {
+        for entry in cursor {
             match entry {
                 Ok((_key, value)) => {
                     let item = schema::Item::from_bytes(value.value());
