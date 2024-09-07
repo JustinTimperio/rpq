@@ -9,25 +9,59 @@
 //! The RPQ should always be created with the new function like so:
 //!
 //! ```rust
-//! use rpq::RPQ;
-//! use rpq::schema::RPQOptions;
 //! use chrono::Duration;
+//! use rpq::{schema::RPQOptions, schema::Item, RPQ};
 //!
-//! #[tokio::main]
+//! #[tokio::main(flavor = "multi_thread")]
 //! async fn main() {
+//!     let message_count = 1_000;
+//!
 //!     let options = RPQOptions {
-//!        max_priority: 10,
-//!        disk_cache_enabled: false,
-//!        database_path: "/tmp/rpq.db".to_string(),
-//!        lazy_disk_cache: true,
-//!        lazy_disk_write_delay: Duration::seconds(5),
-//!        lazy_disk_cache_batch_size: 10_000,
+//!         max_priority: 10,
+//!         disk_cache_enabled: true,
+//!         database_path: "/tmp/rpq-prioritize.redb".to_string(),
+//!         lazy_disk_cache: true,
+//!         lazy_disk_write_delay: Duration::seconds(5),
+//!         lazy_disk_cache_batch_size: 10_000,
 //!     };
 //!
-//!     let r = RPQ::<i32>::new(options).await;
-//!     if r.is_err() {
-//!         // handle logic
-//!    }
+//!     let r = RPQ::new(options).await;
+//!     match r {
+//!         Ok(_) => {}
+//!         Err(e) => {
+//!             println!("Error Creating RPQ: {}", e);
+//!             return;
+//!         }
+//!     }
+//!
+//!     let (rpq, _restored_items) = r.unwrap();
+//!
+//!     for i in 0..message_count {
+//!         let item = Item::new(
+//!             i % 10,
+//!             i,
+//!             false,
+//!             None,
+//!             false,
+//!             None,
+//!         );
+//!
+//!         let result = rpq.enqueue(item).await;
+//!         if result.is_err() {
+//!             println!("Error Enqueuing: {}", result.err().unwrap());
+//!             return;
+//!         }
+//!     }
+//!
+//!     for _i in 0..message_count {
+//!         let result = rpq.dequeue().await;
+//!             if result.is_err() {
+//!                 println!("Error Dequeuing: {}", result.err().unwrap());
+//!                 return;
+//!             }
+//!         }
+//!
+//!     rpq.close().await;
 //! }
 //! ```
 //!

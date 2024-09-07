@@ -1,10 +1,9 @@
-use core::time;
 use std::fs::File;
 use std::sync::atomic::Ordering;
 use std::sync::Arc;
 
-use rpq::pq::Item;
-use rpq::{RPQOptions, RPQ};
+use chrono::Duration;
+use rpq::{schema::Item, schema::RPQOptions, RPQ};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
@@ -74,9 +73,8 @@ async fn bench(
         disk_cache_enabled: disk_cache_enabled,
         database_path: "/tmp/rpq.redb".to_string(),
         lazy_disk_cache: lazy_disk_cache,
-        lazy_disk_write_delay: std::time::Duration::from_secs(5),
+        lazy_disk_write_delay: Duration::seconds(5),
         lazy_disk_cache_batch_size: 5000,
-        buffer_size: 1_000_000,
     };
 
     let r = RPQ::new(options).await;
@@ -100,7 +98,7 @@ async fn bench(
                 },
                 _ = async {
                     loop {
-                        tokio::time::sleep(time::Duration::from_secs(1)).await;
+                        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
                         let results = rpq_clone.prioritize().await;
 
                         if !results.is_err() {
@@ -121,9 +119,9 @@ async fn bench(
             i % bucket_count,
             i,
             true,
-            Some(std::time::Duration::from_secs(1)),
+            Some(Duration::seconds(1)),
             true,
-            Some(std::time::Duration::from_secs(2)),
+            Some(Duration::seconds(2)),
         );
         let result = rpq.enqueue(item).await;
         if result.is_err() {

@@ -34,3 +34,4 @@ inherits = "release"
 
 [workspace]
 members = ["graphs"]
+name = "rpq-graphs"

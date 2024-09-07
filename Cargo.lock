@@ -226,6 +226,13 @@ checksum = "40ecd4077b5ae9fd2e9e169b102c6c330d0605168eb0e8bf79952b256dbefffd"
 [[package]]
 name = "graphs"
 version = "0.1.0"
+dependencies = [
+ "chrono",
+ "csv",
+ "rand",
+ "rpq",
+ "tokio",
+]
 
 [[package]]
 name = "hashbrown"

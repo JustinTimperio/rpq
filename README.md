@@ -73,23 +73,20 @@ rpq = "0.2.0"
 
 #### Example Usage
 ```rust
-use std::sync::Arc;
-use std::time::Duration;
-
-use rpq::pq::Item;
-use rpq::{RPQOptions, RPQ};
+use chrono::Duration;
+use rpq::{schema::RPQOptions, schema::Item, RPQ};
 
 #[tokio::main(flavor = "multi_thread")]
 async fn main() {
     let message_count = 1_000_000;
 
     let options = RPQOptions {
-        bucket_count: 10,
-        disk_cache_enabled: false,
-        database_path: "/tmp/rpq.redb".to_string(),
-        lazy_disk_cache: false,
-        lazy_disk_max_delay: Duration::from_secs(5),
-        lazy_disk_cache_batch_size: 5000,
+        max_priority: 10,
+        disk_cache_enabled: true,
+        database_path: "/tmp/rpq-prioritize.redb".to_string(),
+        lazy_disk_cache: true,
+        lazy_disk_write_delay: Duration::seconds(5),
+        lazy_disk_cache_batch_size: 10_000,
     };
 
     let r = RPQ::new(options).await;
